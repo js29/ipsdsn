@@ -6,16 +6,17 @@ http://www.biorxiv.org/content/early/2017/01/06/095943
 
 The code includes:
 * Example pipeline for aligning RNA-seq reads, and quantifying expression
-* Calling eQTLs and splice QTLs with FastQTL and with RASQUAL
-* Producing plots included in the paper
+* Calling eQTLs and splice QTLs with FastQTL, RASQUAL, and leafcutter
+* Many of the analyses described in the paper
 
 ## Directories
 * **analysis** - scripts to analyse processed sensory neuron data
-* **data** - input data for analyses (e.g. gene expression counts)
+* **data** - input data for analyses (e.g. sample metadata)
 * **pipeline** - scripts to process raw data, e.g. alignment, quantification
 * **utils** - utility scripts
 
 Scripts within these directories may refer to files that are not part of the Github repository. Aligned BAM files are available from EGA (EGAD00001003145, 80 managed-access RNA-seq samples) or from ENA (accession ERP020576, 51 open-access RNA-seq samples). Similarly, ATAC-seq data for 8 and 23 managed and open-access samples are available. Summary statistics and gene expression counts are available at https://www.ebi.ac.uk/biostudies/studies/S-BSST16.
+Expression counts are not provided in the github repository, as they are available at the biostudies link above. Also, only expression counts for open-access samples could be provided.
 
 ## Analysis
 This directory includes mainly R scripts used for high-levels analyses, including producing figures in the paper.
