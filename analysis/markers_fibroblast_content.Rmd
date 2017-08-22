@@ -1,0 +1,268 @@
+# Analysis looking at expression of marker genes and fibroblast content
+
+##Introduction
+We clustered scRNA-seq data into sensory neurons and cells with a fibroblast-like expression profile. We used Cibersort to estimate the fibroblast-like content of bulk samples by using reference profiles from the single-cell data. Many of the bulk samples were estimated to have very high (> 75%) fibroblast content. A question is whether this accurately reflect the true content of fibroblast-like cells, or whether differences between the scRNA-seq data (from a P1 protocol cell line matured to 8 weeks) and the bulk RNA-seq (from P2V2 protocol lines matured to 4 weeks) cause those estimates to be too high.
+While we have no true answer of fibroblast-like content, one way to investigate this is to look at the expression of neuronal marker genes in samples estimated to have high vs. low fibroblast-like content.
+
+```{r Setup, echo=FALSE, warning=FALSE, message=FALSE}
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(data.table)
+library(ggplot2)
+library(stringr)
+library(Homo.sapiens)
+library(pheatmap)
+library(RColorBrewer)
+
+options(stringsAsFactors = F)
+opts_chunk$set(echo = FALSE)
+
+rpkmFname <- "../results/MDS/rpkms.gtex.ips.drg.sn.rds"
+sampleMetaFname <- "../results/MDS/rpkms.sample_meta.txt"
+outputDir <- "../results/fibroblast_content/"
+```
+
+Load RPKM data for sensory neuron RNA-seq samples.
+
+```{r LoadData, warning=FALSE, message=FALSE}
+rpkm.df <- na.omit(readRDS(rpkmFname))
+colnames(rpkm.df) = tolower(colnames(rpkm.df))
+colnames(rpkm.df)[1] = "gene_id"
+rownames(rpkm.df) = rpkm.df$gene_id
+
+sample.meta <- read.delim(sampleMetaFname)
+sample.meta$SAMPID = tolower(sample.meta$SAMPID)
+rownames(sample.meta) = sample.meta$SAMPID
+# Shorten a couple cell type names
+sample.meta$SMTSD[sample.meta$SMTSD == "Cells - EBV-transformed lymphocytes"] = "LCLs"
+sample.meta$SMTSD[sample.meta$SMTSD == "Cells - Transformed fibroblasts"] = "Fibroblasts"
+
+# Subset sample.meta to those samples we have RPKM data for
+sample.meta = na.omit(sample.meta[colnames(rpkm.df),])
+
+sn.meta.all = read.csv("../data/Metadata_All_Lines.csv", header=T)
+sn.meta.all$Sample = tolower(sn.meta.all$Sample)
+sn.meta.all = sn.meta.all %>% filter(! Sample %in% c("posc_1", "iakz_1", "koun_2", "yuze_1_1", "yuze_1_2"))
+sn.meta.all$RIN[sn.meta.all$RIN == "X"] = NA
+sn.meta.all$RIN = as.numeric(sn.meta.all$RIN)
+sn.meta.all = sn.meta.all[sn.meta.all$Sample %in% colnames(rpkm.df),]
+sn.meta.P2 = sn.meta.all[sn.meta.all$Protocol == "P2V2" & sn.meta.all$Extraction.Replicate == "A", ]
+  
+symbols = AnnotationDbi::select(Homo.sapiens,keys=rpkm.df$gene_id,
+                                keytype="ENSEMBL",columns="SYMBOL")
+symbols %<>% group_by(ENSEMBL) %>% 
+             summarise(SYMBOL=paste(SYMBOL, collapse="|"))
+annotation = rpkm.df[, 1, drop=F] %>% dplyr::inner_join(symbols, by = c("gene_id" = "ENSEMBL"))
+```
+
+Let's look at the relative expression of marker genes in IPSDSNs compared with DRG and GTEx samples (fibroblasts cells, nerve, and brain-cortex). Different ways of normalising the data do seem to have an effect on the results. But when looking across samples, it seems like the most sensible normalisation is:
+a) First take log10(data + 0.1)
+b) Z-scale the data for each gene across samples. This gives a measure of the level of expression of the gene in a sample relative to other samples.
+We can then either look at a set of marker genes, or look genome-wide (or at a large set of genes).
+
+```{r FibroblastNeuronMarkers, warning=FALSE, message=FALSE}
+sn.meta.plot = sn.meta.all[sn.meta.all$Sample %in% colnames(rpkm.df) & sn.meta.all$Extraction.Replicate == "A",]
+sn.meta.plot = sn.meta.plot[order(-sn.meta.plot$fibroblast_fraction.V5),]
+
+nerve.samples = sample(sample.meta$SAMPID[sample.meta$SMTSD == "Nerve - Tibial"], size=50)
+fibroblast.samples = sample(sample.meta$SAMPID[sample.meta$SMTSD == "Fibroblasts"], size=50)
+cortex.samples = sample(sample.meta$SAMPID[sample.meta$SMTSD == "Brain - Cortex"], size=50)
+stomach.samples = sample(sample.meta$SAMPID[sample.meta$SMTSD == "Stomach"], size=50)
+drg.samples = sample.meta$SAMPID[sample.meta$SMTSD == "DRG"]
+
+plot.ann = data.frame(sampleID = c(sn.meta.plot$Sample, drg.samples, fibroblast.samples, nerve.samples, cortex.samples),
+                          tissue = c(paste("IPSDSN", sn.meta.plot$Protocol),
+                                     rep("DRG", length(drg.samples)),
+                                     rep("fibroblast", 50),
+                                     rep("nerve", 50),
+                                     rep("cortex", 50)))
+rownames(plot.ann) = plot.ann$sampleID
+  
+rpkm.df.plot = rpkm.df[, c("gene_id", plot.ann$sampleID)]
+rownames(rpkm.df.plot) = rpkm.df.plot$gene_id
+
+annotation = rpkm.df.plot[, 1, drop=F] %>% dplyr::inner_join(symbols, by = c("gene_id" = "ENSEMBL"))
+markers.neuron = c("SCN9A","PRPH","TUBA1A","PIEZO2","CHRNB2", "DRGX", "NGFR", "ISL1") #Neuronal/sensory
+markers.neuron = c("SCN9A","PIEZO2","CHRNB2", "DRGX", "NGFR", "ISL1") #Neuronal/sensory
+markers.fib = c("RPLP1","VIM","CD63","MSN","ITGB1")  #Fibroblastic
+markers = c(markers.neuron, markers.fib)
+markers.ann = annotation[annotation$SYMBOL %in% markers,]
+rownames(markers.ann) = markers.ann$SYMBOL
+
+e.data = rpkm.df.plot[markers.ann$gene_id, plot.ann$sampleID]
+rownames(e.data) = markers.ann$SYMBOL
+
+e.data = log10(e.data+0.1)
+e.data[e.data < -2] = -2
+
+e.data %<>% t() %>% scale() %>% t()
+e.data[e.data >  2] =  2
+e.data[e.data < -2] = -2
+
+plot.ann$`fib. fraction` = NA
+plot.ann[sn.meta.plot$Sample, "fib. fraction"] = sn.meta.plot$fibroblast_fraction.V5
+
+pheatmap(e.data, cluster_cols = F,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         cutree_rows = 2, fontsize=10, 
+         show_colnames = F, main = "Fibroblast & Neuron markers")
+```
+
+The plot above is not clustered, and IPSDSN samples are ordered according to their estimated fibroblast content. Visually the IPSDSN samples seem to have a marker gene expression profile that is most similar to DRG, particular for neuronal genes. If you look closely it appears that IPSDSN samples with higher fibroblast content (left end of the plot) are more similar to GTEx fibroblast expression than those with low fibroblast content.
+
+The plot below is clustered by similarity of the scaled expression values. IPSDSN samples do clearly cluster with DRG.
+Note that this clustering is not neccesarily the case when you use simple log(rpkm) values rather than Z-scaling them across samples.
+
+```{r FibroblastNeuronMarkers2, warning=FALSE, message=FALSE}
+pheatmap(e.data, cluster_cols = T,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         cutree_rows = 2,
+         show_colnames = F, main = "Fibroblast & Neuron markers (clustered)")
+```
+
+Using only neuronal marker genes we get a similar clustering, but with a few IPSDSN samples clustering together with Nerve.
+
+```{r FibroblastNeuronMarkers3, warning=FALSE, message=FALSE}
+e.data.neuron = e.data[markers.ann[markers.neuron,]$SYMBOL,]
+pheatmap(e.data.neuron, cluster_cols = T,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         show_colnames = F, main = "Neuron markers")
+```
+
+Using only fibroblast marker genes, the main thing we see is that cortex clusters separately, whereas all the other tissues/cells are more similar in their fibroblast-marker expression profiles.
+
+```{r FibroblastNeuronMarkers4, warning=FALSE, message=FALSE}
+e.data.fib = e.data[markers.ann[markers.fib,]$SYMBOL,]
+pheatmap(e.data.fib, cluster_cols = T,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         show_colnames = F, main = "Fibroblast markers")
+```
+
+We can cluster based on a larger number of genes... e.g. 1000 randomly selected expressed genes. Of course this produces a clean clustering. I'm not sure this is interesting though. 
+
+```{r UseAllExpressedGenes, warning=FALSE, message=FALSE}
+e.data = rpkm.df.plot[, plot.ann$sampleID]
+e.data = e.data[rowMeans(e.data) > 1,]
+
+e.data = log10(e.data+0.1)
+e.data[e.data < -2] = -2
+
+e.data %<>% t() %>% scale() %>% t()
+e.data[e.data >  2] =  2
+e.data[e.data < -2] = -2
+
+pheatmap(e.data[sample(1:nrow(e.data), size = 1000),], cluster_cols = T, cluster_rows = T,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         show_colnames = F, show_rownames = F, treeheight_row = 0,
+         main = "Clustering with 1000 random genes")
+
+```
+
+Another way to consider the similarity of high-fibroblast samples vs. low to GTEx tissues is to just get the genome-wide correlation (or marker gene correlation) between these and GTEx samples. We first get the average RPKM values for each GTEx tissue, and for IPSDSN samples split into 4 quartiles of estimated fibroblast-like content.
+
+```{r FibroblastQuantiles, warning=FALSE, message=FALSE}
+sn.meta.P2 = sn.meta.P2[order(-sn.meta.P2$fibroblast_fraction.V5),]
+
+N = nrow(sn.meta.P2)
+qs = c(as.integer(floor(N/4)), as.integer(floor(N/2)), as.integer(floor(3*N/4)))
+quartile.1.samples = sn.meta.P2$Sample[1:qs[1]]
+quartile.2.samples = sn.meta.P2$Sample[(qs[1]+1):qs[2]]
+quartile.3.samples = sn.meta.P2$Sample[(qs[2]+1):qs[3]]
+quartile.4.samples = sn.meta.P2$Sample[(qs[3]+1):N]
+
+mean.rpkm.df = data.frame(IPSDSN.Q1=rowMeans(rpkm.df[,quartile.1.samples]),
+                          IPSDSN.Q2=rowMeans(rpkm.df[,quartile.2.samples]),
+                          IPSDSN.Q3=rowMeans(rpkm.df[,quartile.3.samples]),
+                          IPSDSN.Q4=rowMeans(rpkm.df[,quartile.4.samples]),
+                          DRG=rowMeans(rpkm.df[,drg.samples]),
+                          fibroblast=rowMeans(rpkm.df[,fibroblast.samples]),
+                          nerve=rowMeans(rpkm.df[,nerve.samples]),
+                          cortex=rowMeans(rpkm.df[,cortex.samples]))
+
+mean.rpkm.df = mean.rpkm.df[rowMeans(mean.rpkm.df) > 1,]
+
+e.data = log(mean.rpkm.df + 0.1)
+d = cor(e.data, method = "pearson")
+pheatmap(d, show_colnames = T, show_rownames = T,
+         cluster_cols = F, cluster_rows = F,
+         display_numbers = T, number_format = "%.2f", fontsize_number=12,
+         fontsize=11, main = "Tissue correlation - genome-wide (Pearson)")
+
+d = cor(e.data, method = "spearman")
+pheatmap(d, show_colnames = T, show_rownames = T,
+         cluster_cols = F, cluster_rows = F,
+         display_numbers = T, number_format = "%.2f", fontsize_number=12,
+         fontsize=10, main = "Tissue correlation - genome-wide (Spearman)")
+
+
+#e.data = e.data[markers.ann$gene_id,]
+# Looking at correlation across such a limited subset of genes is
+# not really informative, so we skip it
+
+```
+
+The first plot uses Pearson correlation, the second plot Spearman rank correlation. The results are not much different.
+What I think the interesting trends are:
+
+- Samples in high vs. low quartiles of estimated fibroblast content have nearly the same similarity with DRG.
+- Samples in the lower quartiles of fibroblast content are considerably less similar to GTEx fibroblasts and nerve.
+- All IPSDSN quartiles are about equal or more similar to DRG than to fibroblasts.
+- Low-fibroblast content samples are slightly more similar to brain cortex. The lower similarity with fibroblasts and nerve, and to a lesser extent DRG, might indicate that these other tissues have more of a mixture of non-neuronal cells than brain.
+
+Here tibial nerve seems to show a relatively high correlation with fibroblasts. However, note that in the larger correlation plot where I compared single cell profiles as well, tibial nerve shows fairly high similarity to all other tissues (except brain & blood). This could reflect that (a) most tissues are innervated, and/or that (b) the tibial nerve samples themselves contain fibroblast-like cells, as do other tissues.
+
+
+We can try to do the same, but without first averaging across samples. I'm not sure this gives us anything extra of interest.
+
+```{r FibroblastQuantiles2, warning=FALSE, message=FALSE}
+e.data = rpkm.df.plot[, plot.ann$sampleID]
+e.data = e.data[rowMeans(e.data) > 1,]
+
+e.data = log10(e.data+0.1)
+e.data[e.data < -2] = -2
+
+e.data %<>% t() %>% scale() %>% t()
+e.data[e.data >  2] =  2
+e.data[e.data < -2] = -2
+
+plot.ann = data.frame(sampleID = c(sn.meta.plot$Sample, drg.samples, fibroblast.samples, nerve.samples, cortex.samples),
+                          tissue = c(paste("IPSDSN", sn.meta.plot$Protocol),
+                                     rep("DRG", length(drg.samples)),
+                                     rep("fibroblast", 50),
+                                     rep("nerve", 50),
+                                     rep("cortex", 50)))
+rownames(plot.ann) = plot.ann$sampleID
+  
+plot.ann$`fib. fraction` = NA
+plot.ann[sn.meta.plot$Sample, "fib. fraction"] = sn.meta.plot$fibroblast_fraction.V5
+
+d = cor(e.data, method = "pearson")
+pheatmap(d, show_colnames = F, show_rownames = F,
+         cluster_cols = F, cluster_rows = F,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         fontsize=10, main = "Tissue correlation - genome-wide (Pearson)")
+
+pheatmap(d, show_colnames = F, show_rownames = F,
+         cluster_cols = T, cluster_rows = F,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         fontsize=10, main = "Tissue correlation - genome-wide (Pearson)")
+
+pal = brewer.pal(6, "Dark2")
+ann_colors = list(tissue = c(`IPSDSN P1`=pal[1],
+                             `IPSDSN P2V2`=pal[2],
+                             DRG=pal[3],
+                             fibroblast=pal[4],
+                             nerve=pal[5],
+                             cortex=pal[6]))
+d = cor(e.data, method = "spearman")
+pheatmap(d, show_colnames = F, show_rownames = F,
+         cluster_cols = T, cluster_rows = F,
+         annotation_colors = ann_colors,
+         annotation_col = plot.ann[, c("tissue", "fib. fraction")], annotation_names_col = F,
+         annotation_row = plot.ann[, c("tissue", "fib. fraction")], annotation_names_row = F,
+         fontsize=10, main = "Tissue correlation - genome-wide (Spearman)")
+
+```
+

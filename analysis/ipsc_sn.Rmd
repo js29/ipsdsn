@@ -1,0 +1,1376 @@
+# Sensory neuron and iPSC: correlations with metadata and gene expression PCs
+
+## Introduction
+
+Are there effects observable in iPSCs which are carried over following differentiation?
+More specifically, can gene expression in iPSCs predict measurable factors in IPSDSNs, such as gene expression or neuronal content?
+
+```{r Setup, message=FALSE, warning=FALSE, echo=FALSE}
+library(knitr)
+library(Homo.sapiens)
+library(dplyr)
+library(readr)
+library(magrittr)
+library(ggplot2)
+library(pheatmap)
+library(stringr)
+library(DESeq2)
+library(pcaMethods)
+library(corrplot)
+library(GOsummaries)
+
+options(stringsAsFactors=F)
+
+outputPath = "../results/ipsc_sn/hg37."
+unionExpressedGenes = FALSE
+```
+
+## Setup
+
+Load data and report some summary stats.
+We'll use DeSeq's variance-stabilized assay value to compute PCs.
+
+```{r LoadAndAnnotation, warning=FALSE, message=FALSE, echo=FALSE}
+readCounts = function(fname) {
+  counts = read.delim(fname)
+  # Fix gene names to remove the version number (e.g. ".4" in ENSG00000223972.4)
+  gene_ids <- gsub("\\.[\\d]+", "", counts[,1], perl=T)
+  counts[,1] = gene_ids
+  rownames(counts) = gene_ids
+  counts
+}
+sn.counts = readCounts("../../sn_hg37/sn.hg37.gencode_full.counts.txt.gz")
+sn.gene.meta = sn.counts[,c(1,2)]
+sn.counts = sn.counts[, -c(1,2)]
+colnames(sn.counts) = tolower(colnames(sn.counts))
+rownames(sn.gene.meta) = sn.gene.meta$gene_id
+rownames(sn.counts) = sn.gene.meta$gene_id
+
+sn.meta.all = read.delim("../data/metadata.all.txt")
+sn.meta.all$Sample = tolower(sn.meta.all$Sample)
+sn.meta.all$Protocol[grep("P2V2", sn.meta.all$Protocol)] <- "P2"
+rownames(sn.meta.all) <- sn.meta.all$Sample
+
+sn.meta = sn.meta.all %>% filter(! Sample %in% c("posc_1", "iakz_1", "koun_2", "yuze_1_1", "yuze_1_2"))
+sn.counts = sn.counts %>% dplyr::select(-one_of(c("posc_1", "iakz_1", "koun_2", "yuze_1_1", "yuze_1_2")))
+
+# Now remove extraction replicates, as these aren't interesting for us here
+sn.meta = sn.meta %>% filter(Extraction.Replicate == "A")
+rownames(sn.meta) <- sn.meta$Sample
+
+# Load rheobase information
+pheno = read.csv("../data/cellular_phenotypes.csv", stringsAsFactors = FALSE)
+pheno$Cell.line = tolower(pheno$Cell.line)
+sample.table.rheo = full_join(
+  pheno,
+  data.frame(
+    RNA.Sample = colnames(sn.counts),
+    Cell.line = str_extract(colnames(sn.counts), regex("^.{4}_\\d+")),
+ stringsAsFactors = FALSE
+  ),
+  by = "Cell.line"
+) %>%
+  dplyr::select(Cell.line, RNA.Sample, mean.rheo) %>%
+  na.omit() %>%
+  filter(!duplicated(Cell.line))
+
+sn.meta %<>% left_join(sample.table.rheo[,c("RNA.Sample", "mean.rheo")], by=c("Sample" = "RNA.Sample"))
+rownames(sn.meta) = sn.meta$Sample
+
+colnames(sn.meta)[which(colnames(sn.meta) == "fibroblast_fraction.V5")] = "fib.V5"
+
+sn.meta.rep <- sn.meta %>% filter(donor %in% c("guss", "hehd", "nukw", "pelm", "podx", "qaqx"))
+sn.meta.P2 <- sn.meta %>% filter(Protocol == "P2", Extraction.Replicate == "A")
+
+hipsci.meta = read.delim("../../reference/hipsci/hipsci.REL-2016-09.sample_meta.txt")
+hipsci.meta.qc1 = read.delim("../data/hipsci.qc1_sample_info.20150918.tsv")
+# Add in a couple of fields that seem to be missing from the newer HIPSCI metadata
+hipsci.meta = hipsci.meta %>% dplyr::left_join(hipsci.meta.qc1[, c("biosample_id", "assaytime_rnaseq", "age")], by="biosample_id")
+sn.meta.hipsci.rna = sn.meta %>% dplyr::inner_join(hipsci.meta[, c("name", "assaypassage_rnaseq")], by=c("HipsciID" = "name"))
+rownames(hipsci.meta) = hipsci.meta$name
+
+hipsci.counts = readCounts("../../hipsci/hipsci.hg37.gencode_full.counts.txt.gz")
+hipsci.gene.meta = hipsci.counts[, 1:2]
+# The first 2 cols are gene_id and length - remove these
+#rownames(hipsci.counts) = hipsci.counts$gene_id
+#hipsci.counts = hipsci.counts[, -c(1,2)]
+
+hipsci.samples.df <- data.frame(HipsciID=gsub(".", "-", colnames(hipsci.counts), fixed=T))
+colnames(hipsci.counts) = hipsci.samples.df$HipsciID
+sn.meta.hipsci = sn.meta %>% dplyr::left_join(hipsci.samples.df)
+rownames(sn.meta.hipsci) = sn.meta.hipsci$Sample
+
+hipsci.gene.meta = hipsci.gene.meta[,1,drop=F] %>% dplyr::inner_join(sn.gene.meta, by=c("gene_id"))
+
+# Have a look at the SN samples where we don't have corresponding RNA data (RPKMs) for HIPSCI
+# It turns out that most of these didn't have RNA-seq done, and some had RNA but from a
+# different line for the same individual.
+# View(sn.meta.hipsci.rna[!sn.meta.hipsci.rna$HipsciID %in% sn.meta.hipsci$HipsciID,])
+
+print("Number of differentiations where we have RNA-seq for a HIPSCI sample with RNA-seq:")
+dim(sn.meta.hipsci)[1]
+
+print("Number of unique HIPSCI lines differentiated:")
+length(unique(sn.meta.hipsci$HipsciID))
+
+print("From number of donors:")
+length(unique(sn.meta.hipsci$donor))
+
+print("Genes/donors in HIPSCI:")
+print(dim(hipsci.counts))
+```
+
+Get a basic summary of gene RPKMs and determine expressed genes in iPSCs and IPSDSNs.
+
+```{r ExpressionSummary.1, warning=FALSE, message=FALSE, echo=FALSE}
+hipsci.sampleids = unique(colnames(hipsci.counts)[colnames(hipsci.counts) %in% sn.meta$HipsciID])
+hipsci.sn.ids = hipsci.sampleids
+
+# Subset to genes in common
+sharedGenes = hipsci.gene.meta$gene_id
+sn.counts = sn.counts[sharedGenes, sn.meta$Sample]
+hipsci.counts.sn = hipsci.counts[sharedGenes, hipsci.sampleids]
+
+# Use counts from Deseq to have same normalisation between SNs and HIPSCI
+coldata = data.frame(sampleID = colnames(sn.counts))
+sn.dds = DESeqDataSetFromMatrix(sn.counts, coldata, ~0)
+colnames(sn.dds) = colnames(sn.counts)
+sn.vst = varianceStabilizingTransformation(sn.dds)
+sn.dds <- estimateSizeFactors(sn.dds)
+sn.counts.deseq = counts(sn.dds, normalized=T)
+colnames(sn.counts.deseq) = colnames(sn.counts)
+#hist(colSums(sn.counts.deseq), breaks=50, main="Sensory neuron counts per sample (Deseq normalised)")
+#summary(colSums(sn.counts.deseq))
+
+coldata = data.frame(sampleID = colnames(hipsci.counts.sn))
+hipsci.dds = DESeqDataSetFromMatrix(hipsci.counts.sn, coldata, ~0)
+hipsci.dds <- estimateSizeFactors(hipsci.dds)
+hipsci.vst <- varianceStabilizingTransformation(hipsci.dds)
+hipsci.counts.deseq = counts(hipsci.dds, normalized=T)
+colnames(hipsci.counts.deseq) = colnames(hipsci.counts.sn)
+#hist(colSums(hipsci.counts.deseq), breaks=50, main="HIPSCI counts per sample (Deseq normalised)")
+#summary(colSums(hipsci.counts.deseq))
+
+sn.rpkm = apply(sn.counts.deseq, MARGIN=2, FUN=function(x) x / sum(x)) * 1e6 * 1e3
+sn.rpkm = apply(sn.rpkm, MARGIN=2, FUN=function(x) x / hipsci.gene.meta$length)
+#mean(sn.rpkm)
+
+hipsci.rpkm = apply(hipsci.counts.deseq, MARGIN=2, FUN=function(x) x / sum(x)) * 1e6 * 1e3
+hipsci.rpkm = apply(hipsci.rpkm, MARGIN=2, FUN=function(x) x / hipsci.gene.meta$length)
+#mean(hipsci.rpkm)
+```
+
+```{r ExpressionSummary.2, warning=FALSE, message=FALSE, echo=FALSE, eval=FALSE}
+rpkm.means.df = data.frame(gene_id=rownames(sn.rpkm), rpkm=rowMeans(sn.rpkm), celltype="IPSDSN")
+rpkm.means.df = rbind(rpkm.means.df, data.frame(gene_id=rownames(hipsci.rpkm), rpkm=rowMeans(hipsci.rpkm), celltype="IPSC"))
+ggplot(rpkm.means.df, aes(x=log(rpkm), fill=celltype)) +
+  geom_histogram(position="dodge") + theme_bw(12) + ggtitle("Histogram of gene mean RPKM across sample")
+
+ggplot(rpkm.means.df, aes(x=log(rpkm), fill=celltype)) +
+  geom_density(alpha=0.5) + theme_bw(12) + ggtitle("Density plot of gene mean RPKM across samples")
+
+sample.rpkm.means.df = data.frame(sample_id=colnames(sn.rpkm), rpkm=colMeans(sn.rpkm), celltype="IPSDSN")
+sample.rpkm.means.df = rbind(sample.rpkm.means.df, data.frame(sample_id=colnames(hipsci.rpkm), rpkm=colMeans(hipsci.rpkm), celltype="IPSC"))
+ggplot(sample.rpkm.means.df, aes(x=rpkm, fill=celltype)) +
+  geom_density(alpha=0.5) + theme_bw(12) + ggtitle("Density plot of sample mean RPKM across genes")
+
+gene.rpkm.df = data.frame(geneid=rownames(sn.rpkm), sn.rpkm=rowMeans(sn.rpkm), ips.rpkm=rowMeans(hipsci.rpkm))
+ggplot(gene.rpkm.df, aes(x=log(sn.rpkm), y=log(ips.rpkm))) + geom_point() + ggtitle("HIPSCI - IPSDSN gene rpkm correlation")
+
+nsamples = dim(sn.rpkm)[2]
+half = floor(nsamples / 2)
+gene.rpkm.df = data.frame(sn.rpkm1=rowMeans(sn.rpkm[,1:half]), sn.rpkm2=rowMeans(sn.rpkm[,(half+1):nsamples]))
+ggplot(gene.rpkm.df, aes(x=log(sn.rpkm1), y=log(sn.rpkm2))) + geom_point() + ggtitle("IPSDSN - IPSDSN gene rpkm correlation")
+```
+
+```{r ExpressedGenes, warning=FALSE, message=FALSE, echo=FALSE}
+if (unionExpressedGenes) {
+  print("Using union of minimally expressed genes between IPS and SNs.")
+  
+  # Merge samples together so that we can determine which genes are not
+  # expressed at all
+  all.rpkm = cbind(sn.rpkm, hipsci.rpkm)
+  expressedInSamples0.01 = apply(all.rpkm, 1, FUN=function(x) sum(x > 0.01))
+  expressedInSamples0.1 = apply(all.rpkm, 1, FUN=function(x) sum(x > 0.1))
+  expressedInSamples1.0 = apply(all.rpkm, 1, FUN=function(x) sum(x > 1))
+  hist(expressedInSamples0.1, breaks=100, main="Number of samples (HIPSCI+IPSDSN)\nwhere gene expressed > 0.1 RPKM")
+
+  # Consider only genes with expression above RPKM 0.1 in more than 1 sample
+  # This gets rid of nearly 20,000 genes
+  expressedGenes = names(expressedInSamples0.1[expressedInSamples0.1 > 1])
+  print("Number of genes expressed at RPKM > 0.1 in 2 or more samples:")
+  length(expressedGenes)
+
+  hipsci.expressedGenes = expressedGenes
+  sn.expressedGenes = expressedGenes
+} else {
+  print("Using expressed genes with RPKM > 1, separately in IPS and SNs.")
+  sn.geneMedianRpkm = apply(sn.rpkm, MARGIN=1, FUN=median)
+  sn.geneMeanRpkm = apply(sn.rpkm, MARGIN=1, FUN=mean)
+  sn.expressedGenes = names(sn.geneMedianRpkm[sn.geneMedianRpkm >= 1])
+  print(paste("Number of expressed genes in SNs:", length(sn.expressedGenes)))
+
+  hipsci.geneMedianRpkm = apply(hipsci.rpkm, MARGIN=1, FUN=median)
+  hipsci.geneMeanRpkm = apply(hipsci.rpkm, MARGIN=1, FUN=mean)
+  hipsci.expressedGenes = names(hipsci.geneMedianRpkm[hipsci.geneMedianRpkm >= 1])
+  print(paste("Number of expressed genes in IPSCs:", length(hipsci.expressedGenes)))
+}
+```
+
+
+## Results
+
+Look at HIPSCI samples that were used to make sensory neurons (87 of them), and see if PCs of gene expression from iPSCs correlate with any of their metadata.
+
+```{r ExplorePCs.1, warning=FALSE, message=FALSE, echo=FALSE}
+hipsci.vst.x = assay(hipsci.vst)[hipsci.expressedGenes,]
+colnames(hipsci.vst.x) = hipsci.sampleids
+sn.vst.x = assay(sn.vst)[sn.expressedGenes,]
+colnames(sn.vst.x) = sn.meta$Sample
+
+pca.result = pcaMethods::pca(t(hipsci.vst.x), nPcs = 5)
+#hipsci.sn.pcs = cbind(data.frame(HipsciID=hipsci.sn.ids), scores(pca.result))
+hipsci.sn.pcs = scores(pca.result)
+colnames(hipsci.sn.pcs) = paste0(".Hipsci.", colnames(hipsci.sn.pcs))
+
+PCnames = factor(names(pca.result@R2), levels=c("PC1", "PC2", "PC3", "PC4", "PC5"))
+ggplot(data.frame(R2=pca.result@R2, PC=PCnames), aes(x=PC, y=R2)) +
+  geom_bar(stat="identity") + ggtitle("Variance explained by HIPSCI RNA-seq PCs")
+
+pca.result = pcaMethods::pca(t(sn.vst.x), nPcs = 5)
+sn.pcs = as.data.frame(scores(pca.result))
+colnames(sn.pcs) = paste0(".IPSDSN.", colnames(sn.pcs))
+#sn.pcs$Sample = rownames(sn.pcs)
+ggplot(data.frame(R2=pca.result@R2, PC=PCnames), aes(x=PC, y=R2)) +
+  geom_bar(stat="identity") + ggtitle("Variance explained by IPSDSN RNA-seq PCs")
+
+# First see what Hipsci PCs correlate with in Hipsci metadata
+rownames(hipsci.meta) = hipsci.meta$name
+#hipsci.meta$age_int = sapply(hipsci.meta$age, FUN=function(x) as.integer(strsplit(x, "-", fixed=T)[[1]][1]))
+
+hipsci.meta.sn = hipsci.meta[hipsci.sn.ids,]
+colnames(hipsci.meta.sn)[which(colnames(hipsci.meta.sn) == "assaypassage_rnaseq")] = "passage"
+colnames(hipsci.meta.sn)[which(colnames(hipsci.meta.sn) == "growing_conditions_rnaseq")] = "growing_cond"
+hipsci.meta.sn = cbind(hipsci.meta.sn, hipsci.sn.pcs)
+  
+hipsci.meta.sn.cor = hipsci.meta.sn %>%
+  dplyr::select(name, gender, growing_cond, pluri_raw, pluri_novelty, passage, assaytime_rnaseq,
+         starts_with(".Hipsci"))
+hipsci.meta.sn.cor$gender = as.integer(factor(hipsci.meta.sn.cor$gender))
+hipsci.meta.sn.cor$growing_cond = as.integer(factor(hipsci.meta.sn.cor$growing_cond))
+hipsci.meta.sn.cor$assaytime_rnaseq = as.integer(as.Date(hipsci.meta.sn.cor$assaytime_rnaseq, format = "%Y-%m-%d"))
+#hipsci.meta.sn.cor = cbind(hipsci.meta.sn.cor, hipsci.sn.pcs)
+
+cor.mtest <- function(mat, conf.level = 0.95) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat <- lowCI.mat <- uppCI.mat <- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    diag(lowCI.mat) <- diag(uppCI.mat) <- 1
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], conf.level = conf.level)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+            lowCI.mat[i, j] <- lowCI.mat[j, i] <- tmp$conf.int[1]
+            uppCI.mat[i, j] <- uppCI.mat[j, i] <- tmp$conf.int[2]
+        }
+    }
+    return(list(p.mat, lowCI.mat, uppCI.mat))
+}
+
+docorrplot = function(mat, title="", showP=FALSE) {
+  m.cor = cor(mat, use = "pairwise.complete.obs")
+  cor.sig = cor.mtest(mat, 0.95)
+  sig = cor.sig[[1]]
+  rownames(sig) = rownames(m.cor)
+  colnames(sig) = colnames(m.cor)
+  
+  cex.before <- par("cex")
+  par(cex = 0.75)
+  if (showP) {
+    corrplot(m.cor, method = "ellipse", order="alphabet",
+             p.mat = sig, sig.level = -1, insig = "p-value",
+             title=title, mar=c(0,0.2,1.5,0))
+  } else {
+    corrplot(m.cor, method = "ellipse", order="alphabet",
+             p.mat = sig, sig.level = 0.01, addCoef.col="blue",
+             title=title, mar=c(0,0.2,1.5,0))
+  }
+  par(cex = cex.before)
+}
+
+mat = as.matrix(hipsci.meta.sn.cor %>% dplyr::select(-name))
+docorrplot(mat, title="iPSC PC correlations-87 samples used to make SNs")
+```
+
+In the HIPSCI PCs we see correlations between growing conditions (feeder vs. E8) and PC1, and between gender and PC4.
+Let's explore these in more detail.
+
+```{r ExplorePCs.HIPSCI.growing_cond, warning=FALSE, message=FALSE, echo=FALSE}
+#summary(lm(growing_cond ~ .Hipsci.PC1, data=na.omit(hipsci.meta.sn.cor[, c("growing_cond", ".Hipsci.PC1")])))
+ggplot(hipsci.meta.sn, aes(x=growing_cond, y=.Hipsci.PC1)) + geom_text(aes(label=name)) +
+  theme_bw(12) + ggtitle("Feeder vs. E8 conditions correlate with HIPSCI PC1")
+```
+
+We can see that one sample had no growing condition specified, but it was clearly done with E8. Another sample was labeled as being on feeders, but it was also clearly E8. Higher PC1 correlates with being on feeders.
+Let's see what GO terms are enriched in PC1 and PC4.
+
+```{r ExplorePCs.HIPSCI.growing_cond.2, warning=FALSE, message=FALSE, echo=FALSE}
+pca = prcomp(t(hipsci.vst.x))
+gs_pca = gosummaries(pca, annotation = hipsci.meta.sn, components=1:5)
+plot(gs_pca, components = 1, fontsize = 10, term_length=24)
+#plot(gs_pca, components = 2, fontsize = 10)
+gs.results.df = attributes(gs_pca)$gprofiler_results
+totalGenes = 2e4
+gs.results.df$expectedOverlaps = gs.results.df$query.size * gs.results.df$term.size / totalGenes
+gs.results.df$foldEnrichment = gs.results.df$overlap.size / gs.results.df$expectedOverlaps
+#View(gs.results.df[, c("p.value", "expectedOverlaps", "foldEnrichment", "term.name")])
+write.table(data.frame(geneid=names(pca$rotation[,1]), weight=pca$rotation[,1])
+                %>% arrange(-weight),
+            file=paste0(outputPath, "ipsc.PC1.geneweights.txt"), col.names=F, row.names=F, quote=F, sep="\t")
+```
+
+GO enrichment of PC1 genes shows few processes enriched in E8 cells, but a number of processes slightly enriched on feeders: SMAD protein signal transduction, anatomical structure formation, growth, regulation of MAPK cascade, etc., as well as a number of categories related to differentiation and development.
+
+Let's look at the gender correlation.
+
+```{r ExplorePCs.HIPSCI.3, warning=FALSE, message=FALSE, echo=FALSE}
+ggplot(hipsci.meta.sn, aes(x=gender, y=.Hipsci.PC5)) + geom_text(aes(label=name)) +
+  theme_bw() + ggtitle("Gender correlates with HIPSCI PC5")
+
+plot(gs_pca, components = 4, fontsize = 10, term_length=24)
+```
+
+Do the same as before, but using all 239 HIPSCI samples.
+
+```{r ExplorePCs.HIPSCI.4, warning=FALSE, message=FALSE, echo=FALSE}
+hipsci.counts.2 = hipsci.counts[sharedGenes, -c(1,2)]
+coldata = data.frame(sampleID = colnames(hipsci.counts.2))
+hipsci.dds = DESeqDataSetFromMatrix(hipsci.counts.2, coldata, ~0)
+hipsci.dds <- estimateSizeFactors(hipsci.dds)
+hipsci.vst.all <- varianceStabilizingTransformation(hipsci.dds)
+hipsci.counts.all.deseq = counts(hipsci.dds, normalized=T)
+colnames(hipsci.counts.all.deseq) = colnames(hipsci.counts.2)
+
+hipsci.vst.all.x = assay(hipsci.vst.all)[hipsci.expressedGenes,]
+colnames(hipsci.vst.all.x) = coldata$sampleID
+
+pca.result = pcaMethods::pca(t(hipsci.vst.all.x), nPcs = 5)
+hipsci.all.pcs = scores(pca.result)
+colnames(hipsci.all.pcs) = paste0(".Hipsci.", colnames(hipsci.all.pcs))
+
+PCnames = factor(names(pca.result@R2), levels=c("PC1", "PC2", "PC3", "PC4", "PC5"))
+ggplot(data.frame(R2=pca.result@R2, PC=PCnames), aes(x=PC, y=R2)) +
+  geom_bar(stat="identity") + ggtitle("Variance explained by HIPSCI RNA-seq PCs")
+
+colnames(hipsci.meta)[which(colnames(hipsci.meta) == "assaypassage_rnaseq")] = "passage"
+colnames(hipsci.meta)[which(colnames(hipsci.meta) == "growing_conditions_rnaseq")] = "growing_cond"
+hipsci.meta.all = cbind(hipsci.meta, hipsci.all.pcs)
+  
+hipsci.meta.all.cor = hipsci.meta.all %>%
+  dplyr::select(name, gender, growing_cond, pluri_raw, pluri_novelty, passage, assaytime_rnaseq,
+         starts_with(".Hipsci"))
+hipsci.meta.all.cor$gender = as.integer(factor(hipsci.meta.all.cor$gender))
+hipsci.meta.all.cor$growing_cond = as.integer(factor(hipsci.meta.all.cor$growing_cond))
+hipsci.meta.all.cor$assaytime_rnaseq = as.integer(as.Date(hipsci.meta.all.cor$assaytime_rnaseq, format = "%Y-%m-%d"))
+#hipsci.meta.sn.cor = cbind(hipsci.meta.sn.cor, hipsci.sn.pcs)
+
+cor.mtest <- function(mat, conf.level = 0.95) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat <- lowCI.mat <- uppCI.mat <- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    diag(lowCI.mat) <- diag(uppCI.mat) <- 1
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], conf.level = conf.level)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+            lowCI.mat[i, j] <- lowCI.mat[j, i] <- tmp$conf.int[1]
+            uppCI.mat[i, j] <- uppCI.mat[j, i] <- tmp$conf.int[2]
+        }
+    }
+    return(list(p.mat, lowCI.mat, uppCI.mat))
+}
+
+docorrplot = function(mat, title="", showP=FALSE) {
+  m.cor = cor(mat, use = "pairwise.complete.obs")
+  cor.sig = cor.mtest(mat, 0.95)
+  sig = cor.sig[[1]]
+  rownames(sig) = rownames(m.cor)
+  colnames(sig) = colnames(m.cor)
+  
+  cex.before <- par("cex")
+  par(cex = 0.75)
+  if (showP) {
+    corrplot(m.cor, method = "ellipse", order="alphabet",
+             p.mat = sig, sig.level = -1, insig = "p-value",
+             title=title, mar=c(0,0.2,1.5,0))
+  } else {
+    corrplot(m.cor, method = "ellipse", order="alphabet",
+             p.mat = sig, sig.level = 0.01, addCoef.col="blue",
+             title=title, mar=c(0,0.2,1.5,0))
+  }
+  par(cex = cex.before)
+}
+
+mat = as.matrix(hipsci.meta.all.cor %>% dplyr::select(-name))
+docorrplot(mat, title="iPSC PC correlations-239 iPSC samples")
+
+# Plot the association between iPSC PC1 and feeder status
+plot.df = hipsci.meta.all %>% dplyr::select(.Hipsci.PC1, growing_cond)
+plot.df$growing_cond[plot.df$growing_cond == "Feeder-dependent"] = "Feeder"
+plot.df$growing_cond[plot.df$growing_cond == "Feeder-free"] = "E8"
+p = ggplot(plot.df, aes(x=growing_cond, y=.Hipsci.PC1)) +
+  geom_boxplot(width=1, outlier.shape=NA) +
+  geom_jitter(width=0.5, size=0.7) +
+  theme_bw(16) + theme(axis.title.x = element_blank()) +
+  scale_x_discrete(expand=c(0.2,0.2)) +
+  ylab("iPSCs PC1")
+print(p)
+saveRDS(p, paste0(outputPath, "iPSC.PC1.wasFeeder.plot.rds"))
+```
+
+Let's now define PCs using all differentiation replicates, after exclusions. Because the effect of protocol version will have a strong impact on gene expression, we do this with P2 samples only.
+
+```{r ExplorePCs.2, warning=FALSE, message=FALSE, echo=FALSE}
+sn.meta.hipsci.P2 = sn.meta[sn.meta.hipsci$Protocol == "P2",]
+
+sn.meta.hipsci.P2 = sn.meta.hipsci.P2 %>%
+  dplyr::left_join(hipsci.meta.sn %>% dplyr::select(name, gender, growing_cond, pluri_raw, pluri_novelty, passage, starts_with(".Hipsci")),
+            by=c("HipsciID" = "name"))
+
+sn.vst.x.P2 = sn.vst.x[, sn.meta.hipsci.P2$Sample]
+pca.result = pcaMethods::pca(t(sn.vst.x.P2), nPcs = 5)
+sn.pcs = as.data.frame(scores(pca.result))
+colnames(sn.pcs) = paste0(".IPSDSN.", colnames(sn.pcs))
+ggplot(data.frame(R2=pca.result@R2, PC=PCnames), aes(x=PC, y=R2)) +
+  geom_bar(stat="identity") + ggtitle("Variance explained by HIPSCI P2 sample RNA-seq PCs")
+
+sn.meta.hipsci.P2 = cbind(sn.meta.hipsci.P2, sn.pcs)
+
+sn.meta.hipsci.P2.cor = sn.meta.hipsci.P2 %>%
+  dplyr::select(Sample, RNA.Date, wasFeeder, Assigned.counts, fib.V5, RIN,
+                gender, growing_cond, pluri_raw, pluri_novelty, passage,
+                starts_with(".IPSDSN"), starts_with(".Hipsci"))
+
+sn.meta.hipsci.P2.cor$RNA.Date = as.integer(as.Date(sn.meta.hipsci.P2.cor$RNA.Date, format = "%d/%m/%Y"))
+sn.meta.hipsci.P2.cor$wasFeeder = as.integer(factor(sn.meta.hipsci.P2.cor$wasFeeder))
+sn.meta.hipsci.P2.cor$RIN = as.numeric(sn.meta.hipsci.P2.cor$RIN)
+sn.meta.hipsci.P2.cor$gender = as.integer(factor(sn.meta.hipsci.P2.cor$gender))
+sn.meta.hipsci.P2.cor$growing_cond = as.integer(factor(sn.meta.hipsci.P2.cor$growing_cond))
+
+mat = as.matrix(sn.meta.hipsci.P2.cor %>% dplyr::select(-Sample))
+#mat = as.matrix(sn.meta.hipsci.P2.cor)
+docorrplot(mat, title="IPSDSN correlations-106 P2V2 samples")
+
+ggplot(sn.meta.hipsci.P2, aes(x=wasFeeder, y=fib.V5)) + geom_boxplot(width=0.5, outlier.shape=NA) + geom_jitter(width=0.2) + theme_bw() + ggtitle("V5 fibroblast content vs. wasFeeder")
+ggplot(sn.meta.hipsci.P2, aes(x=wasFeeder, y=.IPSDSN.PC1)) + geom_boxplot(width=0.5, outlier.shape=NA) + geom_jitter(width=0.2) + theme_bw() + ggtitle("IPSDSN PC1 vs. wasFeeder")
+
+# Export figs at size 2.2 x 3.0 in
+sn.meta.plot = sn.meta.hipsci.P2
+sn.meta.plot$wasFeeder = as.character(sn.meta.plot$wasFeeder)
+sn.meta.plot$wasFeeder[sn.meta.plot$wasFeeder == "NO"] = "E8"
+sn.meta.plot$wasFeeder[sn.meta.plot$wasFeeder == "YES"] = "Feeder"
+p = ggplot(sn.meta.plot, aes(x=wasFeeder, y=.IPSDSN.PC1)) +
+  geom_boxplot(width=1, outlier.shape=NA) +
+  geom_jitter(width=0.5, size=0.7) +
+  theme_bw(14) + theme(axis.title.x = element_blank()) +
+  scale_x_discrete(expand=c(0.2,0.2)) +
+  ylab("iPSDSN  PC1")
+print(p)
+saveRDS(p, paste0(outputPath, "SN.PC1.wasFeeder.plot.rds"))
+
+p = ggplot(sn.meta.plot, aes(x=wasFeeder, y=fib.V5)) +
+  geom_boxplot(width=1, outlier.shape=NA) +
+  geom_jitter(width=0.5, size=0.7) +
+  theme_bw(14) + theme(axis.title.x = element_blank()) +
+  scale_x_discrete(expand=c(0.2,0.2)) +
+  ylab("Fibroblast fraction")
+print(p)
+
+p = ggplot(sn.meta.plot, aes(x=wasFeeder, y=1-fib.V5)) +
+  geom_boxplot(width=1, outlier.shape=NA) +
+  geom_jitter(width=0.5, size=0.7) +
+  theme_bw(16) + theme(axis.title.x = element_blank()) +
+  scale_x_discrete(expand=c(0.2,0.2)) +
+  ylab("Neural fraction")
+print(p)
+saveRDS(p, paste0(outputPath, "SN.fib.v5.wasFeeder.plot.rds"))
+
+ggplot(sn.meta.plot, aes(x=.IPSDSN.PC1, y=.IPSDSN.PC3, color=wasFeeder)) +
+  geom_point(size=3) + theme_bw(14)
+
+ggplot(sn.meta.plot, aes(x=.IPSDSN.PC1, y=.IPSDSN.PC3, fill=fib.V5 * 100, shape=wasFeeder)) +
+  geom_point(size = 4) + scale_shape_manual(values = c(21,23)) +
+  xlab(paste("PC1 (", round(R2cum(pca.result)[1],2)*100,"%)",sep="")) +
+  ylab(paste("PC3 (", round(diff(R2cum(pca.result))[2],2)*100,"%)",sep="")) +
+  theme_bw(14) +
+  scale_fill_continuous(name = "Fib. %", low = "blue", high = "yellow2") +
+  theme(legend.justification = c(0, 0), legend.position = c(0, 0))
+
+summary(lm(fib.V5 ~ wasFeeder, data=sn.meta.hipsci.P2.cor))
+
+# Do another correlation plot, this time with fewer factors for use
+# as a paper figure.
+sn.meta.hipsci.P2.cor2 = sn.meta.hipsci.P2 %>%
+  dplyr::select(Sample, RNA.Date, wasFeeder, fib.V5, gender,
+                starts_with(".IPSDSN"), starts_with(".Hipsci"))
+
+sn.meta.hipsci.P2.cor2$RNA.Date = as.integer(as.Date(sn.meta.hipsci.P2.cor2$RNA.Date, format = "%d/%m/%Y"))
+sn.meta.hipsci.P2.cor2$wasFeeder = as.integer(factor(sn.meta.hipsci.P2.cor2$wasFeeder))
+sn.meta.hipsci.P2.cor2$gender = as.integer(factor(sn.meta.hipsci.P2.cor2$gender))
+mat2 = as.matrix(sn.meta.hipsci.P2.cor2 %>% dplyr::select(-Sample))
+docorrplot(mat2, title="IPSDSN correlations-106 P2V2 samples")
+
+sn.meta.hipsci.P2.cor2 = sn.meta.hipsci.P2 %>%
+  dplyr::select(Sample, RNA.Date, wasFeeder, fib.V5, 
+                .IPSDSN.PC1, .IPSDSN.PC2, .IPSDSN.PC3,
+                .Hipsci.PC1, .Hipsci.PC2, .Hipsci.PC3)
+
+sn.meta.hipsci.P2.cor2$RNA.Date = as.integer(as.Date(sn.meta.hipsci.P2.cor2$RNA.Date, format = "%d/%m/%Y"))
+sn.meta.hipsci.P2.cor2$wasFeeder = as.integer(factor(sn.meta.hipsci.P2.cor2$wasFeeder))
+mat2 = as.matrix(sn.meta.hipsci.P2.cor2 %>% dplyr::select(-Sample))
+docorrplot(mat2, title="IPSDSN correlations-106 P2V2 samples")
+```
+
+Let's first consider correlations with SN PCs and metadata.
+The main thing we see is correlation between SN PC1 and whether the cells were received on feeders. Notably, cells being received on feeders is positively correlated with fibroblast content (IPSCs received on feeders ended up with higher fibroblast content).
+PC1 also correlates with the growing conditions when IPSC RNA-seq was done, but that is probably because this is correlated with date and with whether the cells were on feeders before differentiation.
+
+Regarding HIPSCI RNA-seq PCs, we see correlations between HIPSCI PCs and SN PCs. Notably, HIPSCI PC1 is inversely correlated with SN PC1, and hence also shows opposite correlations with growing conditions and RNA date.
+
+Let's plot the relationships between "wasFeeder" (whether SNs were received on feeders), "growing_cond" (whether iPSCs were grown on feeders prior to iPSC RNA-seq), RNA date, and the SN and iPSC PCs.
+
+```{r ExplorePCs.3, warning=FALSE, message=FALSE, echo=FALSE}
+ggplot(sn.meta.hipsci.P2.cor, aes(x=RNA.Date, y=.IPSDSN.PC1)) + geom_point() + theme_bw(12)
+ggplot(sn.meta.hipsci.P2, aes(x=wasFeeder, y=.IPSDSN.PC1)) + geom_boxplot() + geom_jitter(width=0.2) + theme_bw(12)
+ggplot(sn.meta.hipsci.P2, aes(x=growing_cond, y=.IPSDSN.PC1)) + geom_boxplot() + geom_jitter(width=0.2) + theme_bw(12)
+```
+
+wasFeeder has a strong relationship with IPSDSN PC1, while RNA date has a modest relationship.
+
+IPSC PC1 correlates better with whether the iPSCs were grown on feeders than whether the SNs were received on feeders. (Trivial, as should be expected.)
+
+Let's put both date and wasFeeder together with neural fraction in a single plot.
+
+```{r Fibroblast.date.wasfeeder.plot, warning=FALSE, message=FALSE, echo=TRUE}
+sn.meta$RNA.Date = as.Date(sn.meta$RNA.Date, format = "%d/%m/%Y")
+meta2 = sn.meta %>% filter(Extraction.Replicate == "A", Sample != "POSC_1")
+meta2$fibroblast_fraction = meta2$fib.V5
+p = ggplot(meta2, aes(x = RNA.Date, y = 1-fibroblast_fraction, 
+	             shape = Protocol)) + 
+  geom_point(position = position_jitter(width=0, height=0.05), size=2) + 
+  geom_vline(xintercept = as.numeric(as.Date("01/07/14", format="%d/%m/%y"))) + 
+  geom_segment(aes(x=date-40,y=1-mean.frac,xend=date+10,yend=1-mean.frac),
+               size=2, 
+               data=meta2 %>% group_by(Protocol) %>% 
+                 summarise(mean.frac = mean(fibroblast_fraction), 
+                           date = mean(RNA.Date)
+  			      )
+  ) +
+  geom_segment(
+    aes(x=date-15,y=1-mean.frac+sd.frac,xend=date-15,
+        yend=1-mean.frac-sd.frac), 
+    size=1,
+    data=meta2 %>% group_by(Protocol) %>% 
+	              summarise(mean.frac = mean(fibroblast_fraction), 
+	                        sd.frac = sd(fibroblast_fraction),
+	                        date = mean(RNA.Date)
+	                        )
+    ) + 
+  ylab("Neural Fraction") + xlab("Date") + theme_bw(base_size=18) +
+  ggtitle("V5 fibroblast fraction")
+print(p)
+
+sep14.date_integer = as.numeric(as.Date("02/09/2014", format = "%d/%m/%Y"))
+feb15.date_integer = as.numeric(as.Date("01/02/2015", format = "%d/%m/%Y"))
+jun15.date_integer = as.numeric(as.Date("10/06/2015", format = "%d/%m/%Y"))
+
+p = ggplot(meta2, aes(x = RNA.Date, y = 1-fibroblast_fraction, shape=Protocol, color=wasFeeder)) + 
+  geom_point(position = position_jitter(width=0, height=0.05), size=2) + 
+  geom_vline(xintercept = as.numeric(as.Date("01/07/14", format="%d/%m/%y"))) +
+  geom_vline(xintercept = sep14.date_integer, linetype="dashed") +
+  geom_vline(xintercept = feb15.date_integer, linetype="dashed", color="red") +
+  geom_vline(xintercept = jun15.date_integer, linetype="dashed", color="blue") +
+  ylab("Neural Fraction") + xlab("Date") + theme_bw(base_size=18) +
+  ggtitle("V5 fibroblast fraction")
+print(p)
+```
+
+Let's use linear models to see how strong these correlations are.
+
+```{r ExplorePCs.4, warning=FALSE, message=FALSE, echo=TRUE}
+res.date = lm(.IPSDSN.PC1 ~ RNA.Date, data = sn.meta.hipsci.P2.cor)
+summary(res.date)
+
+res.feeder = lm(.IPSDSN.PC1 ~ wasFeeder, data = sn.meta.hipsci.P2.cor)
+summary(res.feeder)
+t.test(x = sn.meta.hipsci.P2$.IPSDSN.PC1[sn.meta.hipsci.P2$wasFeeder == "YES"],
+       y = sn.meta.hipsci.P2$.IPSDSN.PC1[sn.meta.hipsci.P2$wasFeeder == "NO"], var.equal=T)
+
+res.feeder.date = lm(.IPSDSN.PC1 ~ RNA.Date + wasFeeder, data = sn.meta.hipsci.P2.cor)
+summary(res.feeder.date)
+#anova(res.date, res.feeder.date)
+
+summary(lm(fib.V5 ~ wasFeeder, data = sn.meta.hipsci.P2.cor))
+summary(lm(fib.V5 ~ RNA.Date, data = sn.meta.hipsci.P2.cor))
+summary(lm(fib.V5 ~ RNA.Date + wasFeeder, data = sn.meta.hipsci.P2.cor))
+
+obj = glm(fib.V5 ~ RNA.Date + wasFeeder, data = sn.meta.hipsci.P2.cor)
+drop1(obj)
+
+# Is fibroblast content explained by PC1 and/or wasFeeder?
+res.fib.PC1 = lm(fib.V5 ~ .IPSDSN.PC1, data = sn.meta.hipsci.P2.cor)
+summary(res.fib.PC1)
+
+res.fib.PC1.wasFeeder = lm(fib.V5 ~ .IPSDSN.PC1 + wasFeeder, data = sn.meta.hipsci.P2.cor)
+summary(res.fib.PC1.wasFeeder)
+anova(res.fib.PC1, res.fib.PC1.wasFeeder)
+obj = glm(fib.V5 ~ .IPSDSN.PC1 + wasFeeder, data = sn.meta.hipsci.P2.cor)
+drop1(obj)
+
+# Is PC1 explained by fibroblast content and/or wasFeeder?
+res.PC1.fib = lm(.IPSDSN.PC1 ~ fib.V5, data = sn.meta.hipsci.P2.cor)
+summary(res.PC1.fib)
+
+res.PC1.fib.wasFeeder = lm(.IPSDSN.PC1 ~ fib.V5 + wasFeeder, data = sn.meta.hipsci.P2.cor)
+summary(res.PC1.fib.wasFeeder)
+anova(res.PC1.fib, res.PC1.fib.wasFeeder)
+```
+
+So RNA date is related to IPSDSN PC1 on its own (p = 1.3e-4), but wasFeeder is more strongly related (p = 6e-8). In a model with both included, RNA date is no longer significant whereas wasFeeder is (p = 1.0e-4), and this model is significantly better than a model with RNA date only (p = 1.0e-4).
+
+Let's see if this holds true as well when instead of treating date as a continuous variable we define it as bins.
+
+```{r ExplorePCs.4b, warning=FALSE, message=FALSE, echo=TRUE}
+sn.meta.P2 = sn.meta %>% filter(Protocol == "P2", Extraction.Replicate == "A")
+sn.meta.P2$RNA.Date = as.Date(sn.meta.P2$RNA.Date, format = "%d/%m/%Y")
+sn.meta.P2$RNA.Date.int = as.integer(as.Date(sn.meta.P2$RNA.Date, format = "%d/%m/%Y"))
+sn.meta.P2$wasFeeder = as.integer(factor(sn.meta.P2$wasFeeder))
+sn.meta.P2$wasFeeder = factor(sn.meta.P2$wasFeeder)
+
+sep14.date_integer = as.integer(as.Date("02/09/2014", format = "%d/%m/%Y"))
+feb15.date_integer = as.integer(as.Date("01/02/2015", format = "%d/%m/%Y"))
+jun15.date_integer = as.integer(as.Date("10/06/2015", format = "%d/%m/%Y"))
+
+sn.meta.P2$RNA.Date.2cat = 0
+sn.meta.P2$RNA.Date.2cat[sn.meta.P2$RNA.Date.int > feb15.date_integer] = 1
+sn.meta.P2$RNA.Date.2cat = as.factor(sn.meta.P2$RNA.Date.2cat)
+
+sn.meta.P2$RNA.Date.3cat = 0
+sn.meta.P2$RNA.Date.3cat[sn.meta.P2$RNA.Date.int > sep14.date_integer] = 1
+sn.meta.P2$RNA.Date.3cat[sn.meta.P2$RNA.Date.int > feb15.date_integer] = 2
+sn.meta.P2$RNA.Date.3cat = as.factor(sn.meta.P2$RNA.Date.3cat)
+
+sn.meta.P2$RNA.Date.4cat = 0
+sn.meta.P2$RNA.Date.4cat[sn.meta.P2$RNA.Date.int > sep14.date_integer] = 1
+sn.meta.P2$RNA.Date.4cat[sn.meta.P2$RNA.Date.int > feb15.date_integer] = 2
+sn.meta.P2$RNA.Date.4cat[sn.meta.P2$RNA.Date.int > jun15.date_integer] = 3
+sn.meta.P2$RNA.Date.4cat = as.factor(sn.meta.P2$RNA.Date.4cat)
+
+#View(sn.meta.P2 %>% dplyr::select(RNA.Date, RNA.Date.int, RNA.Date.2cat, RNA.Date.3cat, RNA.Date.4cat, fib.V5) %>% arrange(RNA.Date.int))
+
+lm1 <- lm(fib.V5 ~ 1, data = sn.meta.P2)
+add1(lm1, ~ wasFeeder + RNA.Date.2cat + RNA.Date.3cat + RNA.Date.4cat)
+# Adding wasFeeder is the best single variable to add, and
+# adding more gives a worse AIC
+
+summary(lm(fib.V5 ~ wasFeeder, data = sn.meta.P2))
+
+summary(lm(fib.V5 ~ wasFeeder + RNA.Date.int, data = sn.meta.P2))
+summary(lm(fib.V5 ~ wasFeeder + RNA.Date.2cat, data = sn.meta.P2))
+summary(lm(fib.V5 ~ wasFeeder + RNA.Date.3cat, data = sn.meta.P2))
+summary(lm(fib.V5 ~ wasFeeder + RNA.Date.4cat, data = sn.meta.P2))
+
+drop1( glm(fib.V5 ~ RNA.Date.2cat + wasFeeder, data = sn.meta.P2) )
+drop1( glm(fib.V5 ~ RNA.Date.3cat + wasFeeder, data = sn.meta.P2) )
+drop1( glm(fib.V5 ~ RNA.Date.4cat + wasFeeder, data = sn.meta.P2) )
+```
+
+We see that "wasFeeder" is significant regardless of the date model. Hooray!
+Let's try to plot what this means on the same plot of neural fraction vs. date.
+
+```{r ExplorePCs.4c, warning=FALSE, message=FALSE, echo=TRUE}
+# Plot the regression lines that we get on the same plot
+sn.meta.P2$culture = factor("E8", levels=c("E8", "MEF"))
+sn.meta.P2$culture[sn.meta.P2$wasFeeder == 2] = "MEF"
+
+fib.data = sn.meta.P2 %>% group_by(culture) %>% 
+                 summarise(mean.frac = 1-mean(fib.V5), 
+                           date = mean(as.Date(RNA.Date, format="%d/%m/%Y")),
+                           sd.frac = sd(fib.V5))
+
+ggplot(sn.meta.P2, aes(x = RNA.Date, y = 1-fib.V5, color=culture)) + 
+  geom_point(position = position_jitter(width=0, height=0.05), size=2) + 
+  geom_vline(xintercept = sep14.date_integer, linetype="dashed") +
+  geom_vline(xintercept = feb15.date_integer, linetype="dashed", color="red") +
+  geom_vline(xintercept = jun15.date_integer, linetype="dashed", color="blue") +
+  geom_segment(aes(x=date, y=mean.frac+sd.frac,
+                   xend=date, yend=mean.frac-sd.frac),
+               data = fib.data, size=1, color="blue") +
+  geom_segment(aes(x=date-10, y=mean.frac,
+                   xend=date+10, yend=mean.frac),
+               data = fib.data, size=1, color="blue") +
+  ylab("Neural Fraction") + xlab("Date") +
+  theme_bw(base_size=18)
+```
+
+This just shows the average neural fraction for samples that were from feeder-iPSCs or not.
+We can also see what it looks like when we split neural fraction by both date (bins) and wasFeeder.
+
+```{r ExplorePCs.4d, warning=FALSE, message=FALSE, echo=TRUE}
+lm1 = lm(fib.V5 ~ culture + RNA.Date.2cat, data = sn.meta.P2)
+date.df = data.frame(culture = factor(c("E8", "MEF"), levels=c("E8", "MEF")),
+                     frac = c(lm1$coefficients["(Intercept)"],
+                              lm1$coefficients["(Intercept)"] + lm1$coefficients["cultureMEF"]),
+                     fracChange = c(lm1$coefficients["RNA.Date.2cat1"], lm1$coefficients["RNA.Date.2cat1"]))
+ggplot(sn.meta.P2, aes(x = RNA.Date, y = 1-fib.V5, color=culture)) + 
+  geom_point(position = position_jitter(width=0, height=0.05), size=2) + 
+  geom_vline(xintercept = sep14.date_integer, linetype="dashed") +
+  geom_vline(xintercept = feb15.date_integer, linetype="dashed", color="red") +
+  geom_vline(xintercept = jun15.date_integer, linetype="dashed", color="blue") +
+  geom_segment(aes(x=c(as.Date("01/07/14", format="%d/%m/%y"), as.Date("01/07/14", format="%d/%m/%y")),
+                   xend=c(as.Date("15/11/15", format="%d/%m/%y"), as.Date("15/11/15", format="%d/%m/%y")),
+                   y=frac, yend=frac+fracChange, color=culture),
+               data = date.df, size=1)
+  ylab("Neural Fraction") + xlab("Date") +
+  theme_bw(base_size=18)
+
+meandates.2cat = sn.meta.P2 %>% group_by(RNA.Date.2cat) %>% 
+                      summarise(date = mean(as.Date(RNA.Date, format="%d/%m/%Y")))
+
+sn.meta.P2$RNA.Date.2cat.mean = meandates.2cat$date[1]
+sn.meta.P2$RNA.Date.2cat.mean[sn.meta.P2$RNA.Date.2cat == "1"] = meandates.2cat$date[2]
+ggplot(sn.meta.P2, aes(x = RNA.Date, y = 1-fib.V5, color=culture)) + 
+  theme_bw(base_size=18) +
+  geom_boxplot(aes(x=RNA.Date.2cat.mean, y=1-fib.V5, group=interaction(RNA.Date.2cat.mean, culture)), width=20) +
+  geom_point(aes(x = RNA.Date, y = 1-fib.V5, color=culture), position = position_jitter(width=0, height=0.03), size=2) + 
+  geom_vline(xintercept = feb15.date_integer, linetype="dashed", color="red") +
+  ylab("Neural Fraction") + xlab("Date")
+
+
+meandates.3cat = sn.meta.P2 %>% group_by(RNA.Date.3cat) %>% 
+                      summarise(date = mean(as.Date(RNA.Date, format="%d/%m/%Y")))
+
+sn.meta.P2$RNA.Date.3cat.mean = meandates.3cat$date[1]
+sn.meta.P2$RNA.Date.3cat.mean[sn.meta.P2$RNA.Date.3cat == "1"] = meandates.3cat$date[2]
+sn.meta.P2$RNA.Date.3cat.mean[sn.meta.P2$RNA.Date.3cat == "2"] = meandates.3cat$date[3]
+# Save at 8x6 for Supplementary Figure
+ggplot(sn.meta.P2, aes(x = RNA.Date, y = 1-fib.V5, color=culture)) + 
+  theme_bw(base_size=18) +
+  geom_boxplot(aes(x=RNA.Date.3cat.mean, y=1-fib.V5, group=interaction(RNA.Date.3cat.mean, culture)), width=20) +
+  geom_point(aes(x = RNA.Date, y = 1-fib.V5, color=culture), position = position_jitter(width=0, height=0.03), size=2) + 
+  geom_vline(xintercept = sep14.date_integer, linetype="dashed") +
+  geom_vline(xintercept = feb15.date_integer, linetype="dashed", color="red") +
+  ylab("Neural Fraction") + xlab("Date") +
+  scale_x_date(date_breaks="3 months", date_labels = "%b %Y")
+
+
+meandates.4cat = sn.meta.P2 %>% group_by(RNA.Date.4cat) %>% 
+                      summarise(date = mean(as.Date(RNA.Date, format="%d/%m/%Y")))
+
+sn.meta.P2$RNA.Date.4cat.mean = meandates.4cat$date[1]
+sn.meta.P2$RNA.Date.4cat.mean[sn.meta.P2$RNA.Date.4cat == "1"] = meandates.4cat$date[2]
+sn.meta.P2$RNA.Date.4cat.mean[sn.meta.P2$RNA.Date.4cat == "2"] = meandates.4cat$date[3]
+sn.meta.P2$RNA.Date.4cat.mean[sn.meta.P2$RNA.Date.4cat == "3"] = meandates.4cat$date[4]
+ggplot(sn.meta.P2, aes(x = RNA.Date, y = 1-fib.V5, color=culture)) + 
+  theme_bw(base_size=18) +
+  geom_boxplot(aes(x=RNA.Date.4cat.mean, y=1-fib.V5, group=interaction(RNA.Date.4cat.mean, culture)), width=20) +
+  geom_point(aes(x = RNA.Date, y = 1-fib.V5, color=culture), position = position_jitter(width=0, height=0.03), size=2) + 
+  geom_vline(xintercept = sep14.date_integer, linetype="dashed") +
+  geom_vline(xintercept = feb15.date_integer, linetype="dashed", color="red") +
+  geom_vline(xintercept = jun15.date_integer, linetype="dashed", color="blue") +
+  ylab("Neural Fraction") + xlab("Date") +
+  scale_x_date(breaks="3 months")
+
+```
+
+We can also see what correlates with rheobase.
+
+```{r ExplorePCs.5, warning=FALSE, message=FALSE, echo=FALSE}
+sn.meta.hipsci.P2.cor.rheo = sn.meta.hipsci.P2 %>%
+  dplyr::select(Sample, Cell.line, RNA.Date, Assigned.counts, fib.V5,
+         gender, pluri_raw, pluri_novelty, passage, mean.rheo, starts_with(".IPSDSN"))
+sn.meta.hipsci.P2.cor.rheo$RNA.Date = as.integer(as.Date(sn.meta.hipsci.P2.cor.rheo$RNA.Date, format = "%d/%m/%Y"))
+sn.meta.hipsci.P2.cor.rheo$gender = as.integer(factor(sn.meta.hipsci.P2.cor.rheo$gender))
+#sn.meta.rheo = sn.meta.rheo %>% left_join(sn.rheo.pcs, by="Sample")
+
+sn.meta.hipsci.P2.cor.rheo = sn.meta.hipsci.P2.cor.rheo %>% filter(!is.na(mean.rheo))
+mat = as.matrix(sn.meta.hipsci.P2.cor.rheo %>% dplyr::select(-Sample, -Cell.line))
+docorrplot(mat, title="IPSDSN correlations including rheobase-106 P2V2 samples")
+```
+
+Again, with this definition of PCs, we have no significant correlation between PCs and rheobase. PCs 1, 2, and 3 all correlate with fibroblast content and RNA date.
+
+```{r ExplorePCs.SN.1, warning=FALSE, message=FALSE, echo=FALSE, eval=FALSE}
+summary(lm(wasFeeder ~ .IPSDSN.PC1, data=na.omit(sn.meta.hipsci.P2.cor.rheo[, c("wasFeeder", ".IPSDSN.PC1")])))
+
+sn.plot.df = sn.meta.hipsci.P2.cor.rheo
+sn.plot.df$name = rownames(sn.plot.df)
+sn.plot.df$wasFeeder[sn.plot.df$wasFeeder == 2] = "feeder"
+sn.plot.df$wasFeeder[sn.plot.df$wasFeeder == 1] = "E8"
+ggplot(sn.plot.df, aes(x=wasFeeder, y=.IPSDSN.PC1)) + geom_text(aes(label=name)) + theme_bw()
+
+ggplot(sn.plot.df, aes(x=fib.V5, y=.IPSDSN.PC2)) + geom_text(aes(label=name)) + theme_bw()
+
+ggplot(sn.plot.df, aes(x=fib.V5, y=.IPSDSN.PC3)) + geom_text(aes(label=name)) + theme_bw()
+
+```
+
+
+Let's find differentially expressed genes between the HIPSCI samples grown on feeders vs. E8, and the GO enrichments for these.
+
+```{r ExplorePCs.HIPSCI.5, warning=FALSE, message=FALSE, echo=FALSE}
+#hipsci.expressed.0.1 = names(hipsci.geneMedianRpkm[hipsci.geneMedianRpkm >= 0.1])
+hipsci.expressed.0.1 = names(hipsci.geneMeanRpkm[hipsci.geneMeanRpkm >= 0.1])
+
+# Collect some gene annotations
+annotation = read.delim("../results/expression_variance/rpkm1/rpkm.summary.sn.txt")
+gene.litcount.df = read.delim("../data/gene.pubmed_lit_count.txt")
+annotation %<>% left_join(gene.litcount.df, by="gene_id")
+
+hipsci.meta.growing_cond = hipsci.meta[hipsci.sn.ids,]
+hipsci.meta.growing_cond = hipsci.meta
+colnames(hipsci.meta.growing_cond)[which(colnames(hipsci.meta.growing_cond) == "assaypassage_rnaseq")] = "passage"
+colnames(hipsci.meta.growing_cond)[which(colnames(hipsci.meta.growing_cond) == "growing_conditions_rnaseq")] = "growing_cond"
+
+hipsci.meta.growing_cond %<>% filter(growing_cond != "")
+#hipsci.meta.growing_cond$growing_cond = factor(hipsci.meta.growing_cond$growing_cond, levels=c("E8", "feeder"))
+hipsci.meta.growing_cond$growing_cond = factor(hipsci.meta.growing_cond$growing_cond, levels=c("Feeder-free", "Feeder-dependent"))
+
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.dds.rds")
+if (file.exists(fname)) {
+  ips.dds = readRDS(fname)
+} else {
+  ips.dds = DESeqDataSetFromMatrix(countData = hipsci.counts[hipsci.expressed.0.1, hipsci.meta.growing_cond$name],
+                               colData = hipsci.meta.growing_cond,
+                               design = ~growing_cond)
+  colnames(ips.dds) = hipsci.meta.growing_cond$name
+  ips.vst = varianceStabilizingTransformation(ips.dds)
+  #ips.vst = varianceStabilizingTransformation(ips.dds, blind=F)
+  ips.dds = DESeq(ips.dds, parallel=T)
+  saveRDS(ips.dds, fname)
+}
+
+ips.deseq.result = results(ips.dds)
+
+par(mai=c(1.2,1.2,1,1))
+plotMA(ips.deseq.result, main="DESeq2 - iPSCs, feeder vs. E8", ylim=c(-4, 4))
+
+
+ips.deseq.res.df = ips.deseq.result %>% as.data.frame()
+ips.deseq.res.df$gene_id = rownames(ips.deseq.res.df)
+ips.deseq.res.df$maxCooks = apply(assays(ips.dds)[["cooks"]], 1, max)
+ips.deseq.res.df$fc = 2^(abs(ips.deseq.res.df$log2FoldChange)) * sign(ips.deseq.res.df$log2FoldChange)
+ips.deseq.res.df %<>% inner_join(annotation, by = "gene_id")
+
+geneIndex = which.min(ips.deseq.result$padj)
+d = DESeq2::plotCounts(ips.dds, gene=geneIndex, intgroup="growing_cond", returnData=TRUE)
+
+ggplot(d, aes(x=growing_cond, y=count)) +
+  geom_point(position=position_jitter(w=0.2,h=0)) +
+  scale_y_log10() + theme_bw(16) +
+  ggtitle(ips.deseq.res.df$gene_name[geneIndex])
+
+ips.deseq.res.df %<>% arrange(padj)
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.results.txt")
+write.table(ips.deseq.res.df, fname, quote=F, sep="\t", row.names=F)
+
+ips.deseq.res.flt = ips.deseq.res.df %>% filter(padj < 0.01, maxCooks < 5) %>%
+                arrange(padj)
+sum(abs(ips.deseq.res.flt$log2FoldChange) > 1)
+
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.flt.txt")
+write.table(ips.deseq.res.flt, fname, quote=F, sep="\t", row.names=F, col.names=F)
+
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.fc_gt_2.txt")
+write.table(ips.deseq.res.flt[ips.deseq.res.flt$log2FoldChange > 1,][, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.fc_lt_-2.txt")
+write.table(ips.deseq.res.flt[ips.deseq.res.flt$log2FoldChange < -1,][, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.fc_gt_1.5.txt")
+write.table(ips.deseq.res.flt[ips.deseq.res.flt$log2FoldChange > 0.585,][, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.fc_lt_-1.5.txt")
+write.table(ips.deseq.res.flt[ips.deseq.res.flt$log2FoldChange < -0.585,][, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+fname = paste0(outputPath, "deseq.iPSC.239.feeder_vs_E8.full.txt")
+write.table(ips.deseq.res.df %>% filter(padj < 0.01, maxCooks < 5) %>%
+                arrange(log2FoldChange) %>% .[, c("gene_id", "log2FoldChange")],
+            fname, quote=F, sep="\t", row.names=F, col.names=F)
+
+ips.upregulatedInFeeder = ips.deseq.res.flt %>% filter(log2FoldChange > 1) %>% .[, "gene_id"]
+ips.upregulatedInE8 = ips.deseq.res.flt %>% filter(log2FoldChange < -1) %>% .[, "gene_id"]
+# log2(1.5 fold change) = 0.584962501
+#ips.upregulatedInFeeder = ips.deseq.res.flt %>% filter(log2FoldChange > 0.584962501) %>% .[, "gene_id"]
+#ips.upregulatedInE8 = ips.deseq.res.flt %>% filter(log2FoldChange < -0.584962501) %>% .[, "gene_id"]
+
+#View(ips.deseq.res.df %>% dplyr::select(gene_id, gene_name, gene_biotype, rsd, avgrpkm, hipsci_mean_rpkm, drg_mean_rpkm, fc, log2FoldChange, padj, maxCooks, CTTV_score, sc.log2FoldChange, pubmed_lit_count))
+
+totalGenes = 2e4
+gl = list(ips.upregulatedInFeeder)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+ips.gs.upInFeeder.df = attributes(gs)$gprofiler_results
+ips.gs.upInFeeder.df$expectedOverlaps = ips.gs.upInFeeder.df$query.size * ips.gs.upInFeeder.df$term.size / totalGenes
+ips.gs.upInFeeder.df$foldEnrichment = ips.gs.upInFeeder.df$overlap.size / ips.gs.upInFeeder.df$expectedOverlaps
+
+gl = list(ips.upregulatedInE8)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+ips.gs.upInE8.df = attributes(gs)$gprofiler_results
+ips.gs.upInE8.df$expectedOverlaps = ips.gs.upInE8.df$query.size * ips.gs.upInE8.df$term.size / totalGenes
+ips.gs.upInE8.df$foldEnrichment = ips.gs.upInE8.df$overlap.size / ips.gs.upInE8.df$expectedOverlaps
+```
+
+The first GOsummaries plot shows gene categories upregulated in IPSCs grown on feeders, and the second shows gene cateogories upregulated in ipSCs grown in E8. I'm not sure how to interpret these exactly, but there are strong differences. Among the top differentially expressed genes are:
+
+- GRIA4 (number 1), 14.7x higher in E8, a glutamate receptor (expressed in iPSCs!)
+- LEFTY2, 102x higher in feeders, required for left-right (L-R) asymmetry determination of organ systems in mammals
+- NPR1, 5.7x higher in E8, receptor for brain natriuretic peptide NPPB/BNP
+- STXBP1, 2.5x higher in E8, Essential for neurotransmission and binds syntaxin, a component of the synaptic vesicle fusion machinery 
+- EMX1, 35.9x higher in E8, may function in combinations with OTX1/2 to specify cell fates in the developing central nervous system
+- CXCR4, 27.7x higher in feeders, cardiac ventricular septum formation, could mediate hippocampal-neuron survival
+- CER1, 142x higher in feeders, Cytokine that may play a role in anterior neural induction and somite formation during embryogenesis in part through a BMP-inhibitory mechanism
+- DUSP6, 19.8x higher in E8, Plays an important role in alleviating chronic postoperative pain
+- BMP2, 13.1x higher in feeders, plays a central role in osteoblast differentiation
+
+Let's make an MA plot suitable for a figure, highlighting genes of interest.
+
+```{r ExplorePCs.HIPSCI.5B, warning=FALSE, message=FALSE, echo=FALSE}
+# To find interesting outlier genes
+res.tmp = ips.deseq.res.flt %>% filter(baseMean > 30, log2FoldChange > 4) %>% arrange(-log2FoldChange)
+res.tmp = ips.deseq.res.flt %>% filter(baseMean > 500, log2FoldChange > 3)
+res.tmp = ips.deseq.res.flt %>% filter(baseMean > 5000, abs(log2FoldChange) > 0.9)
+res.tmp = ips.deseq.res.flt %>% filter(baseMean > 5000, abs(log2FoldChange) > 0.9, pubmed_lit_count > 20)
+res.tmp = ips.deseq.res.flt %>% filter(baseMean > 1000, baseMean < 1e4, log2FoldChange > 1)
+res.tmp = ips.deseq.res.flt %>% filter(log2FoldChange > 4)
+res.tmp = ips.deseq.res.flt %>% filter(abs(log2FoldChange) > 2.5, baseMean < 2.5e1)
+
+genesOfInterest = c("BMP2", "EMX1", "CXCR4", "COL2A1", "TLR4", "PDGFB", "CHGA", "BCHE",
+                    "FN1", "SCD", "DUSP6", "CER1", "TNC", "DKK1", "LEFTY2", "CST1", "ACE2",
+                    "FGB", "FGF17")
+genesOfInterest2 = c("RARB", "ISLR2", "NPPB")
+genesOfInterest3 = c("SFRP2", "PDGFRA", "DNMT3B")
+res.subset = ips.deseq.res.df[match(genesOfInterest, ips.deseq.res.df$gene_name),]
+res.subset.left = ips.deseq.res.df[match(genesOfInterest2, ips.deseq.res.df$gene_name),]
+res.subset.below = ips.deseq.res.df[match(genesOfInterest3, ips.deseq.res.df$gene_name),]
+
+#x=hipsci_mean_rpkm
+p = ggplot(ips.deseq.res.df %>% mutate(sig=(padj < 0.01)), aes(x=baseMean, y=log2FoldChange, col=sig)) +
+  geom_point(size=0.5) +
+  scale_color_manual(values=c("black", "red", "dodgerblue")) +
+  theme_bw(14) +
+  scale_x_log10() + xlab("DESeq2 baseMean expression") +
+  theme(legend.position="none") +
+  geom_point(data=res.subset, mapping=aes(baseMean, log2FoldChange, col="green"), size=2) +
+  annotate(geom="text", x=res.subset$baseMean, y=res.subset$log2FoldChange, label=res.subset$gene_name, hjust = -0.2, size=3.8) +
+  geom_point(data=res.subset.left, mapping=aes(baseMean, log2FoldChange, col="green"), size=2) +
+  annotate(geom="text", x=res.subset.left$baseMean, y=res.subset.left$log2FoldChange, label=res.subset.left$gene_name, hjust = 1.2, size=3.8) +
+  geom_point(data=res.subset.below, mapping=aes(baseMean, log2FoldChange, col="green"), size=2) +
+  annotate(geom="text", x=res.subset.below$baseMean, y=res.subset.below$log2FoldChange, label=res.subset.below$gene_name, hjust=0.2, vjust = 1.5, size=3.8) +
+  coord_cartesian(xlim=c(1e0, 1e5), ylim=c(-4, 6))
+print(p)
+```
+
+Let's plot some differentially expressed genes of interest.
+
+```{r ExplorePCs.HIPSCI.5C, warning=FALSE, message=FALSE, echo=FALSE}
+ips.deseq.res.df = ips.deseq.result %>% as.data.frame()
+ips.deseq.res.df$gene_id = rownames(ips.deseq.res.df)
+ips.deseq.res.df %<>% left_join(annotation, by = "gene_id")
+
+plotDeseqGene = function(res.df, dds, geneName, log=FALSE, noYaxis=TRUE) {
+  geneIndex = which(res.df$gene_name == geneName)
+  geneid = res.df$gene_id[geneIndex]
+  d = DESeq2::plotCounts(dds=dds, gene=geneid, intgroup="growing_cond", returnData=TRUE, main="TEST")
+  d$growing_cond = as.character(d$growing_cond)
+  d$growing_cond[d$growing_cond == "Feeder-free"] = "E8"
+  d$growing_cond[d$growing_cond == "Feeder-dependent"] = "Feeder"
+  
+  p = ggplot(d, aes(x=growing_cond, y=count)) +
+        geom_boxplot(width=1, outlier.shape=NA) +
+        geom_jitter(width=0.5, size=0.7) +
+        theme_bw(15) + theme(axis.title.x = element_blank()) +
+        scale_x_discrete(expand=c(0.2,0.2)) +
+        ggtitle(res.df$gene_name[geneIndex])
+  if (log) {
+    p = p + scale_y_log10()
+  }
+  if (noYaxis) {
+    p = p + theme(axis.title.y=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+  }
+  p
+}
+
+plotDeseqGene(ips.deseq.res.df, ips.dds, "SCN9A", log=T, noYaxis=F)
+plotDeseqGene(ips.deseq.res.df, ips.dds, "EMX1", log=T, noYaxis=F)
+plotDeseqGene(ips.deseq.res.df, ips.dds, "BMP2", log=T, noYaxis=F)
+```
+
+Let's do the same for IPSDSNs which were initially received on feeders or not.
+
+```{r ExploreFeeders.SN.1, warning=FALSE, message=FALSE, echo=FALSE}
+#sn.expressed.0.1 = names(sn.geneMedianRpkm[sn.geneMedianRpkm >= 0.1])
+sn.expressed.0.1 = names(sn.geneMeanRpkm[sn.geneMeanRpkm >= 0.1])
+
+sn.meta.hipsci.P2$wasFeeder = factor(sn.meta.hipsci.P2$wasFeeder, levels=c("NO", "YES"))
+
+fname = paste0(outputPath, "deseq.iPSDSN.106samples.feeder_vs_E8.dds.rds")
+if (file.exists(fname)) {
+  sn.dds = readRDS(fname)
+} else {
+  sn.dds = DESeqDataSetFromMatrix(countData = sn.counts[sn.expressed.0.1, sn.meta.hipsci.P2$Sample],
+                               colData = sn.meta.hipsci.P2,
+                               design = ~wasFeeder)
+  colnames(sn.dds) = sn.meta.hipsci.P2$Sample
+  sn.vst = varianceStabilizingTransformation(sn.dds)
+  #sn.vst = varianceStabilizingTransformation(sn.dds, blind=F)
+  sn.dds = DESeq(sn.dds, parallel=T)
+  saveRDS(sn.dds, fname)
+}
+sn.deseq.result = results(sn.dds)
+
+par(mai=c(1.2,1.2,1,1))
+plotMA(sn.deseq.result, main="DESeq2 - SNs, feeder vs. E8")
+
+sn.deseq.res.df = sn.deseq.result %>% as.data.frame()
+sn.deseq.res.df$gene_id = rownames(sn.deseq.res.df)
+sn.deseq.res.df$maxCooks = apply(assays(sn.dds)[["cooks"]], 1, max)
+sn.deseq.res.df$fc = 2^(abs(sn.deseq.res.df$log2FoldChange)) * sign(sn.deseq.res.df$log2FoldChange)
+sn.deseq.res.df %<>% inner_join(annotation, by = "gene_id")
+
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.results.txt")
+write.table(sn.deseq.res.df, fname, quote=F, sep="\t", row.names=F)
+
+sn.deseq.res.flt = sn.deseq.res.df %>% filter(padj < 0.01, maxCooks < 5) %>%
+                arrange(padj)
+sum(abs(sn.deseq.res.flt$log2FoldChange) > 1)
+
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.flt.txt")
+write.table(sn.deseq.res.flt %>% arrange(log2FoldChange) %>% .[, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+
+sn.upregulatedInFeeder = sn.deseq.res.flt %>% filter(log2FoldChange > 1) %>% .[, "gene_id"]
+sn.upregulatedInE8 = sn.deseq.res.flt %>% filter(log2FoldChange < -1) %>% .[, "gene_id"]
+# log2(1.5 fold change) = 0.584962501
+#sn.upregulatedInFeeder = sn.deseq.res.flt %>% filter(log2FoldChange > 0.584962501) %>% .[, "gene_id"]
+#sn.upregulatedInE8 = sn.deseq.res.flt %>% filter(log2FoldChange < -0.584962501) %>% .[, "gene_id"]
+
+#View(sn.deseq.res.df %>% dplyr::select(gene_id, gene_name, gene_biotype, rsd, avgrpkm, hipsci_mean_rpkm, drg_mean_rpkm, fc, log2FoldChange, padj, maxCooks, CTTV_score, sc.log2FoldChange, pubmed_lit_count))
+
+totalGenes = 2e4
+gl = list(sn.upregulatedInFeeder)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+sn.gs.upInFeeder.df = attributes(gs)$gprofiler_results
+sn.gs.upInFeeder.df$expectedOverlaps = sn.gs.upInFeeder.df$query.size * sn.gs.upInFeeder.df$term.size / totalGenes
+sn.gs.upInFeeder.df$foldEnrichment = sn.gs.upInFeeder.df$overlap.size / sn.gs.upInFeeder.df$expectedOverlaps
+
+gl = list(sn.upregulatedInE8)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+sn.gs.upInE8.df = attributes(gs)$gprofiler_results
+sn.gs.upInE8.df$expectedOverlaps = sn.gs.upInE8.df$query.size * sn.gs.upInE8.df$term.size / totalGenes
+sn.gs.upInE8.df$foldEnrichment = sn.gs.upInE8.df$overlap.size / sn.gs.upInE8.df$expectedOverlaps
+
+pattern.spec.df = data.frame(gene_id=strsplit(sn.gs.upInFeeder.df$intersection[2], split=",", fixed=T)[[1]]) %>% left_join(annotation, by = "gene_id")
+synaptic.sig.df = data.frame(gene_id=strsplit(sn.gs.upInE8.df$intersection[1], split=",", fixed=T)[[1]]) %>% left_join(annotation, by = "gene_id")
+neuron.dev.df = data.frame(gene_id=strsplit(sn.gs.upInE8.df$intersection[3], split=",", fixed=T)[[1]]) %>% left_join(annotation, by = "gene_id")
+neurotrans.df = data.frame(gene_id=strsplit(sn.gs.upInE8.df$intersection[5], split=",", fixed=T)[[1]]) %>% left_join(annotation, by = "gene_id")
+
+
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.fc_gt_2.txt")
+write.table(sn.deseq.res.flt[sn.deseq.res.flt$log2FoldChange > 1,][, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.fc_lt_-2.txt")
+write.table(sn.deseq.res.flt[sn.deseq.res.flt$log2FoldChange < -1,][, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+
+sn.deseq.res.flt.2 = sn.deseq.res.flt %>% filter(abs(fc) > 2) %>% arrange(-log2FoldChange)
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.flt.absfc_gt_2.txt")
+write.table(sn.deseq.res.flt.2[, c("gene_id", "log2FoldChange")], fname, quote=F, sep="\t", row.names=F, col.names=F)
+
+```
+
+Very interesting - many of the gene categories enriched in SNs initially on feeders are the same as those in iPSCs that were on feeders, and the same for E8 samples. Some interesting genes:
+
+- SCN9A, 4.4x higher in E8
+- GRIN1, 4.2x higher in E8
+- CACNA1A, 3.0x higher in E8
+- CHRNB2, 2.3x higher in E8
+- numerous KCNs and SCNs higher in E8
+- P2RX7
+
+Let's do an improved MA plot for a figure.
+
+```{r ExploreFeeders.SN.1B, warning=FALSE, message=FALSE, echo=FALSE}
+# To find interesting outlier genes
+selcols = match(c("baseMean", "log2FoldChange", "padj", "maxCooks", "fc", "avgrpkm", "rsd", "gene_biotype", "gene_name", "hipsci_mean_rpkm", "drg_mean_rpkm", "sc.baseMean", "sc.log2FoldChange", "CTTV_score", "pubmed_lit_count"), colnames(sn.deseq.res.df))
+res.tmp = sn.deseq.res.df %>% filter(log2FoldChange > 3.1) %>% dplyr::select(selcols)
+res.tmp = sn.deseq.res.df %>% filter(log2FoldChange < -2) %>% dplyr::select(selcols)
+res.tmp = sn.deseq.res.df %>% filter(baseMean > 5000, abs(log2FoldChange) > 1) %>% dplyr::select(selcols)
+res.tmp = sn.deseq.res.df %>% filter(baseMean > 5000, abs(log2FoldChange) > 0.9, pubmed_lit_count > 20) %>% dplyr::select(selcols)
+res.tmp = sn.deseq.res.df %>% filter(baseMean > 1000, baseMean < 1e4, log2FoldChange > 1) %>% dplyr::select(selcols)
+res.tmp = sn.deseq.res.df %>% filter(abs(log2FoldChange) > 2.5, baseMean < 2.5e1) %>% dplyr::select(selcols)
+
+# Explore where the genes highlighted as DE in iPSCs fall for IPSDSNs
+genesOfInterest.ipsc = c(genesOfInterest, genesOfInterest2, genesOfInterest3)
+sn.deseq.res.df %>% filter(gene_name %in% genesOfInterest.ipsc) %>% dplyr::select(gene_name, padj)
+
+# "DKK2", "CACNA1A", "ACHE", "COL1A1", 
+genesOfInterest = c("CXCR4", "SFRP2", "PI15", "VAMP8", "TTR", "CDKN1A",
+                    "COL20A1", "CFI", "KCNQ5", "PIEZO2", "RET", "PRPH",
+                    "COL1A2", "COL3A1", "FSTL1", "SLC13A4", "KCNE4", "STOML3", "DACT2")
+genesOfInterest2 = c("GRIN1", "SPTBN1")
+genesOfInterest3 = c("RARB", "P2RX7", "SCN9A", "NRXN2", "FGFR2")
+genesOfInterest4 = c("VCAM1", "L1CAM")
+res.subset = sn.deseq.res.df[match(genesOfInterest, sn.deseq.res.df$gene_name),]
+res.subset.below = sn.deseq.res.df[match(genesOfInterest2, sn.deseq.res.df$gene_name),]
+res.subset.left = sn.deseq.res.df[match(genesOfInterest3, sn.deseq.res.df$gene_name),]
+res.subset.above = sn.deseq.res.df[match(genesOfInterest4, sn.deseq.res.df$gene_name),]
+
+ggplot(sn.deseq.res.df %>% mutate(sig=(padj < 0.01)) %>% filter(gene_biotype %in% c("protein_coding", "lincRNA")),
+       aes(x=baseMean, y=log2FoldChange, col=sig)) +
+  geom_point(size=0.5) +
+  scale_color_manual(values=c("black", "red", "dodgerblue")) +
+  theme_bw(14) +
+  scale_x_log10() + xlab("DESeq2 baseMean expression") +
+  theme(legend.position="none") +
+  geom_point(data=res.subset, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset$baseMean, y=res.subset$log2FoldChange, label=res.subset$gene_name, hjust = -0.2, size=3.8) +
+  geom_point(data=res.subset.below, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset.below$baseMean, y=res.subset.below$log2FoldChange, label=res.subset.below$gene_name, hjust=0.2, vjust = 1.5, size=3.8) +
+  geom_point(data=res.subset.left, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset.left$baseMean, y=res.subset.left$log2FoldChange, label=res.subset.left$gene_name, hjust = 1.2, size=3.8) +
+  geom_point(data=res.subset.above, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset.above$baseMean, y=res.subset.above$log2FoldChange, label=res.subset.above$gene_name, hjust = 0.0, vjust = -0.5, size=3.8) +
+  coord_cartesian(xlim=c(1e0, 1.5e5)) +
+  ylim(-3, 4)
+
+ggplot(sn.deseq.res.df %>% mutate(sig=(padj < 0.01)), aes(x=baseMean, y=log2FoldChange, col=sig)) +
+  geom_point(size=0.5) +
+  scale_color_manual(values=c("black", "red", "dodgerblue")) +
+  theme_bw(14) +
+  scale_x_log10() + xlab("DESeq2 baseMean expression") +
+  theme(legend.position="none") +
+  geom_point(data=res.subset, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset$baseMean, y=res.subset$log2FoldChange, label=res.subset$gene_name, hjust = -0.2, size=3.8) +
+  geom_point(data=res.subset.left, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset.left$baseMean, y=res.subset.left$log2FoldChange, label=res.subset.left$gene_name, hjust = 1.2, size=3.5) +
+  geom_point(data=res.subset.below, mapping=aes(baseMean, log2FoldChange, col="special"), size=2) +
+  annotate(geom="text", x=res.subset.below$baseMean, y=res.subset.below$log2FoldChange, label=res.subset.below$gene_name, hjust=0.2, vjust = 1.5, size=3.5) +
+  coord_cartesian(xlim=c(1e0, 1.5e5))
+```
+
+
+Let's plot some differentially expressed genes of interest.
+
+```{r ExplorePCs.HIPSCI.5C, warning=FALSE, message=FALSE, echo=FALSE}
+DESeq2::plotCounts(sn.dds, main="DESeq2 - iPSCs, feeder vs. E8", ylim=c(-4, 4))
+DESeq2::plotCounts(sn.dds, main="DESeq2 - iPSCs, feeder vs. E8")
+
+sn.deseq.res.df = sn.deseq.result %>% as.data.frame()
+sn.deseq.res.df$gene_id = rownames(sn.deseq.res.df)
+sn.deseq.res.df %<>% left_join(annotation, by = "gene_id")
+
+# Not expressed
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "EMX1", noYaxis=F)
+
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "BMP2", noYaxis=F)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "BMP7", noYaxis=F)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "RET", noYaxis=F)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "KCNQ5", noYaxis=F)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "PRPH", noYaxis=F)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "PI15", noYaxis=F)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "PRPH", noYaxis=F)
+
+plotDeseqGene(sn.deseq.res.df, sn.dds, "SCN9A", noYaxis=F, log=T)
+plotDeseqGene(sn.deseq.res.df, sn.dds, "FGFR2", noYaxis=F, log=T)
+#plotDeseqGene(sn.deseq.res.df, sn.dds, "L1CAM", noYaxis=F, log=T)
+
+
+geneIndex = which(ips.deseq.res.df$gene_name == "SCN9A")
+geneid = ips.deseq.res.df$gene_id[geneIndex]
+d = DESeq2::plotCounts(dds=ips.dds, gene=geneid, intgroup="growing_cond", returnData=TRUE, main="TEST")
+ggplot(d, aes(x=growing_cond, y=count)) +
+  geom_point(position=position_jitter(w=0.2,h=0)) +
+  scale_y_log10() + theme_bw(16) +
+  ggtitle(ips.deseq.res.df$gene_name[geneIndex])
+
+ggplot(d, aes(x=growing_cond, y=count)) +
+  geom_boxplot(width=1, outlier.shape=NA) +
+  geom_jitter(width=0.5, size=0.7) +
+  theme_bw(14) + theme(axis.title.x = element_blank()) +
+  scale_x_discrete(expand=c(0.2,0.2)) +
+  ylab("Expression count") +
+  ggtitle(ips.deseq.res.df$gene_name[geneIndex])
+
+```
+
+Let's take the intersection of the iPSC and SN results - i.e. those genes differentially expressed between feeders & E8 in both cases.
+
+```{r ExploreFeeders.SN.2, warning=FALSE, message=FALSE, echo=FALSE}
+merged.res.df = sn.deseq.res.flt %>%
+  dplyr::select(gene_id, gene_name, gene_biotype, rsd, fc, log2FoldChange, padj) %>%
+  dplyr::inner_join(ips.deseq.res.df %>% dplyr::select(gene_id, avgrpkm, hipsci_mean_rpkm, drg_mean_rpkm, fc, log2FoldChange, padj, CTTV_score, sc.log2FoldChange, pubmed_lit_count), by="gene_id")
+
+merged.res.df.flt = merged.res.df %>% filter(padj.y < 0.01)
+
+# Plot fold change between feeders & E8 in iPSCs and SNs.
+N = nrow(merged.res.df.flt)
+ggplot(merged.res.df.flt %>% arrange(padj.x) %>% .[c(1:500, (N-500):N),], aes(x=log2FoldChange.y, y=log2FoldChange.x)) +
+  geom_point() + ggtitle("Gene fold change on feeders in iPSCs vs. IPSDSNs") +
+  xlab("iPSC log2 fold change") + ylab("SN log2 fold change")
+
+genesUpInBoth = merged.res.df %>% filter(log2FoldChange.x > 0.584962501, log2FoldChange.y > 0.584962501) %>% .$gene_id
+genesDownInBoth = merged.res.df %>% filter(log2FoldChange.x < -0.584962501, log2FoldChange.y < -0.584962501) %>% .$gene_id
+
+gl = list(genesUpInBoth)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+cmp.gs.upInFeedersInBoth.df = attributes(gs)$gprofiler_results
+cmp.gs.upInFeedersInBoth.df$expectedOverlaps = cmp.gs.upInFeedersInBoth.df$query.size * cmp.gs.upInFeedersInBoth.df$term.size / totalGenes
+cmp.gs.upInFeedersInBoth.df$foldEnrichment = cmp.gs.upInFeedersInBoth.df$overlap.size / cmp.gs.upInFeedersInBoth.df$expectedOverlaps
+
+gl = list(genesDownInBoth)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+cmp.gs.downInFeedersInBoth.df = attributes(gs)$gprofiler_results
+cmp.gs.downInFeedersInBoth.df$expectedOverlaps = cmp.gs.downInFeedersInBoth.df$query.size * cmp.gs.downInFeedersInBoth.df$term.size / totalGenes
+cmp.gs.downInFeedersInBoth.df$foldEnrichment = cmp.gs.downInFeedersInBoth.df$overlap.size / cmp.gs.downInFeedersInBoth.df$expectedOverlaps
+term = cmp.gs.downInFeedersInBoth.df$intersection[cmp.gs.downInFeedersInBoth.df$term.name == "anterograde trans-synaptic signaling"] %>%
+  strsplit(",", fixed=T) %>% .[[1]]
+View(merged.res.df.flt[merged.res.df.flt$gene_id %in% term,])
+```
+
+Among the genes which are differentially expressed based on feeder vs. E8 in both iPSC and SNs:
+
+- SNCA, higher in E8, 2.4x in SNs, 1.4x in iPSCs, p<1e-5 in both cases, regulation of dopamine release and transport
+- CXCR4, higher in feeders, 27.7x in iPSCs, 7.5x in SNs, cardiac ventricular septum formation, could mediate hippocampal-neuron survival
+
+Let's include fibroblast content or PC1 in the model and see what genes are still differentially expressed.
+
+```{r ExploreFeeders.SN.3, warning=FALSE, message=FALSE, echo=FALSE}
+sn.dds2 = DESeqDataSetFromMatrix(countData = sn.counts[sn.expressed.0.1, sn.meta.hipsci.P2$Sample],
+                             colData = sn.meta.hipsci.P2,
+                             design = ~fib.V5 + wasFeeder)
+colnames(sn.dds2) = sn.meta.hipsci.P2$Sample
+sn.vst = varianceStabilizingTransformation(sn.dds2)
+#sn.vst = varianceStabilizingTransformation(sn.dds2, blind=F)
+sn.dds2 = DESeq(sn.dds2, parallel=T)
+
+sn.deseq.result = results(sn.dds2)
+
+par(mai=c(1.2,1.2,1,1))
+plotMA(sn.deseq.result, main="DESeq2 - SNs, feeder vs. E8, controlling for fib.V5")
+
+sn.deseq.res.df = sn.deseq.result %>% as.data.frame()
+sn.deseq.res.df$gene_id = rownames(sn.deseq.res.df)
+sn.deseq.res.df$maxCooks = apply(assays(sn.dds2)[["cooks"]], 1, max)
+sn.deseq.res.df$fc = exp(abs(sn.deseq.res.df$log2FoldChange)) * sign(sn.deseq.res.df$log2FoldChange)
+sn.deseq.res.df %<>% left_join(annotation, by = "gene_id")
+
+geneIndex = which.min(sn.deseq.result$padj)
+d = plotCounts(sn.dds2, gene=geneIndex, intgroup="wasFeeder", returnData=TRUE)
+
+ggplot(d, aes(x=wasFeeder, y=count)) +
+  geom_point(position=position_jitter(w=0.2,h=0)) +
+  scale_y_log10() + theme_bw(16) +
+  ggtitle(sn.deseq.res.df$gene_name[geneIndex])
+
+sn.deseq.res.df %<>% arrange(padj)
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.cov_fib.V5.results.txt")
+write.table(sn.deseq.res.df, fname, quote=F, sep="\t", row.names=F)
+
+sn.deseq.res.flt = sn.deseq.res.df %>% filter(padj < 0.01, maxCooks < 5) %>%
+                arrange(padj)
+
+sn.upregulatedInFeeder = sn.deseq.res.flt %>% filter(log2FoldChange > 1) %>% .[, "gene_id"]
+sn.upregulatedInE8 = sn.deseq.res.flt %>% filter(log2FoldChange < -1) %>% .[, "gene_id"]
+# log2(1.5 fold change) = 0.584962501
+#sn.upregulatedInFeeder = sn.deseq.res.flt %>% filter(log2FoldChange > 0.584962501) %>% .[, "gene_id"]
+#sn.upregulatedInE8 = sn.deseq.res.flt %>% filter(log2FoldChange < -0.584962501) %>% .[, "gene_id"]
+
+#View(sn.deseq.res.flt %>% dplyr::select(gene_id, gene_name, gene_biotype, rsd, avgrpkm, hipsci_mean_rpkm, drg_mean_rpkm, fc, log2FoldChange, padj, maxCooks, CTTV_score, sc.log2FoldChange, pubmed_lit_count))
+
+totalGenes = 2e4
+gl = list(sn.upregulatedInFeeder)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+sn.gs.upInFeeder.df = attributes(gs)$gprofiler_results
+sn.gs.upInFeeder.df$expectedOverlaps = sn.gs.upInFeeder.df$query.size * sn.gs.upInFeeder.df$term.size / totalGenes
+sn.gs.upInFeeder.df$foldEnrichment = sn.gs.upInFeeder.df$overlap.size / sn.gs.upInFeeder.df$expectedOverlaps
+
+gl = list(sn.upregulatedInE8)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+sn.gs.upInE8.df = attributes(gs)$gprofiler_results
+sn.gs.upInE8.df$expectedOverlaps = sn.gs.upInE8.df$query.size * sn.gs.upInE8.df$term.size / totalGenes
+sn.gs.upInE8.df$foldEnrichment = sn.gs.upInE8.df$overlap.size / sn.gs.upInE8.df$expectedOverlaps
+```
+
+Interesting genes:
+- OPRD1, 4.4x higher in E8, opiod receptor
+- SCN9A, 2.6x higher in E8
+- CACNA1A, 2.0x higher in E8, calcium channel subunit
+- GRIN1, 3.0x higher in E8, glutamate receptor
+- GRIK2, 3.6x higher in E8, glutamate receptor
+- ADRA2C, 2.7x higher in E8, adrenergic receptor
+- SIGMAR1, 1.7x higher in E8, regulates ion channels like the potassium channel and could modulate neurotransmitter release.
+
+- GRIN2C, 2.1x higher in feeders, glutamate receptor
+- PDE7A, 1.7x higher in feeders, Hydrolyzes the second messenger cAMP, which is a key regulator of many important physiological processes. May have a role in muscle signal transduction.
+
+```{r ExploreFeeders.SN.4, warning=FALSE, message=FALSE, echo=FALSE}
+sn.dds2 = DESeqDataSetFromMatrix(countData = sn.counts[sn.expressed.0.1, sn.meta.hipsci.P2$Sample],
+                             colData = sn.meta.hipsci.P2,
+                             design = ~.IPSDSN.PC1 + wasFeeder)
+colnames(sn.dds2) = sn.meta.hipsci.P2$Sample
+sn.vst = varianceStabilizingTransformation(sn.dds2)
+#sn.vst = varianceStabilizingTransformation(sn.dds2, blind=F)
+sn.dds2 = DESeq(sn.dds2, parallel=T)
+
+sn.deseq.result = results(sn.dds2)
+
+par(mai=c(1.2,1.2,1,1))
+plotMA(sn.deseq.result, main="DESeq2 - SNs, feeder vs. E8, controlling for IPSDSN PC1")
+
+sn.deseq.res.df = sn.deseq.result %>% as.data.frame()
+sn.deseq.res.df$gene_id = rownames(sn.deseq.res.df)
+sn.deseq.res.df$maxCooks = apply(assays(sn.dds2)[["cooks"]], 1, max)
+sn.deseq.res.df$fc = exp(abs(sn.deseq.res.df$log2FoldChange)) * sign(sn.deseq.res.df$log2FoldChange)
+sn.deseq.res.df %<>% left_join(annotation, by = "gene_id")
+
+geneIndex = which.min(sn.deseq.result$padj)
+d = plotCounts(sn.dds2, gene=geneIndex, intgroup="wasFeeder", returnData=TRUE)
+ggplot(d, aes(x=wasFeeder, y=count)) +
+  geom_point(position=position_jitter(w=0.2,h=0)) +
+  scale_y_log10() + theme_bw(16) +
+  ggtitle(sn.deseq.res.df$gene_name[geneIndex])
+
+sn.deseq.res.df %<>% arrange(padj)
+fname = paste0(outputPath, "deseq.SN.feeder_vs_E8.cov_PC1.results.txt")
+write.table(sn.deseq.res.df, fname, quote=F, sep="\t", row.names=F)
+
+sn.deseq.res.flt = sn.deseq.res.df %>% filter(padj < 0.01, maxCooks < 5) %>%
+                arrange(padj)
+
+sn.upregulatedInFeeder = sn.deseq.res.flt %>% filter(log2FoldChange > 1) %>% .[, "gene_id"]
+sn.upregulatedInE8 = sn.deseq.res.flt %>% filter(log2FoldChange < -1) %>% .[, "gene_id"]
+# log2(1.5 fold change) = 0.584962501
+#sn.upregulatedInFeeder = sn.deseq.res.flt %>% filter(log2FoldChange > 0.584962501) %>% .[, "gene_id"]
+#sn.upregulatedInE8 = sn.deseq.res.flt %>% filter(log2FoldChange < -0.584962501) %>% .[, "gene_id"]
+
+#View(sn.deseq.res.df %>% dplyr::select(gene_id, gene_name, gene_biotype, rsd, avgrpkm, hipsci_mean_rpkm, drg_mean_rpkm, fc, log2FoldChange, padj, maxCooks, CTTV_score, sc.log2FoldChange, pubmed_lit_count))
+
+totalGenes = 2e4
+gl = list(sn.upregulatedInFeeder)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+sn.gs.upInFeeder.df = attributes(gs)$gprofiler_results
+sn.gs.upInFeeder.df$expectedOverlaps = sn.gs.upInFeeder.df$query.size * sn.gs.upInFeeder.df$term.size / totalGenes
+sn.gs.upInFeeder.df$foldEnrichment = sn.gs.upInFeeder.df$overlap.size / sn.gs.upInFeeder.df$expectedOverlaps
+
+gl = list(sn.upregulatedInE8)
+gs = gosummaries(gl, max_signif=100)
+plot(gs, fontsize = 12)
+sn.gs.upInE8.df = attributes(gs)$gprofiler_results
+sn.gs.upInE8.df$expectedOverlaps = sn.gs.upInE8.df$query.size * sn.gs.upInE8.df$term.size / totalGenes
+sn.gs.upInE8.df$foldEnrichment = sn.gs.upInE8.df$overlap.size / sn.gs.upInE8.df$expectedOverlaps
+```
+

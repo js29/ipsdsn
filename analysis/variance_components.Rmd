@@ -1,0 +1,283 @@
+# Estimating variance components in sensory neuron RNA-seq
+
+## Introduction
+
+We'll try to determine the effect of the following factors on gene expression variability in sensory neurons:
+- donor/iPSC line (can't separate the two)
+- differentiation protocol
+- differentiation batch
+- sequencing batch
+- feeder vs. E8 at start of differentiation
+- passage
+- gender
+- residual
+
+```{r Setup, message=FALSE, warning=FALSE, echo=FALSE}
+library(knitr)
+opts_chunk$set(warning = F)
+library(dplyr)
+library(readr)
+library(magrittr)
+library(data.table)
+library(ggplot2)
+library(DESeq2)
+library(variancePartition)
+library(doParallel)
+cl <- makeCluster(4)
+registerDoParallel(cl)
+
+options(stringsAsFactors=F)
+
+outputPath = "results/variance_components/"
+```
+
+## Setup
+
+Load expression data and metadata.
+
+```{r LoadAndAnnotation, warning=FALSE, message=FALSE, echo=FALSE}
+expression_data = readRDS("../../eqtl/combined_expression_data.v5.rds")
+sn.counts = expression_data$exprs_counts
+colnames(sn.counts) = tolower(colnames(sn.counts))
+sn.gene.meta = as.data.frame(expression_data$gene_metadata)
+rownames(sn.gene.meta) = sn.gene.meta$gene_id
+
+sn.meta.all = read.csv("../data/Metadata_All_Lines.csv", header=T)
+sn.meta.all$Sample = tolower(sn.meta.all$Sample)
+sn.meta.all$Protocol[grep("P2V2", sn.meta.all$Protocol)] <- "P2"
+rownames(sn.meta.all) <- sn.meta.all$Sample
+
+sn.meta.all$differentiation = sn.meta.all$RNA.Date
+
+# Remove posc_1: sequencing failure
+# Remove iakz and koun: visually non-neuronal
+# Retain yuze_1_1/2, since they were labeled neuronal
+sn.meta = sn.meta.all %>% filter(! Sample %in% c("posc_1", "iakz_1", "koun_2"))
+
+# We ignore extraction replicates for now. We could quantify the variability
+# due to RNA extraction, but this isn't terribly interesting, and the contribution
+# would depend on whether we look at only donors with extraction replicates or
+# at all samples. If looking at all samples the variability due to RNA extraction
+# would be lower, since we have few extraction replicates.
+sn.meta %<>% filter(Extraction.Replicate == "A")
+
+hipsci.meta = read.delim("../../reference/hipsci/hipsci.REL-2016-09.sample_meta.txt")
+hipsci.meta.subset = hipsci.meta %>% dplyr::select(name, assaypassage_rnaseq, gender)
+sn.meta %<>% left_join(hipsci.meta.subset, by=c("HipsciID" = "name"))
+
+# Some of the HIPSCI samples aren't in the metadata above - I guess those are only
+# the RNA-seq samples. So we get gender from the QC1 data for those samples where
+# it is missing.
+hipsci.meta.qc1 = read.delim("../data/hipsci.qc1_sample_info.20150918.tsv")
+hipsci.meta.subset = hipsci.meta.qc1 %>% dplyr::select(name, donor, gender)
+rownames(hipsci.meta.subset) = hipsci.meta.subset$name
+sn.meta$gender[is.na(sn.meta$gender)] = hipsci.meta.subset[sn.meta$HipsciID[is.na(sn.meta$gender)], ]$gender
+
+colnames(sn.meta)[which(colnames(sn.meta) == "fibroblast_fraction.V5")] = "fib.V5"
+
+sn.counts = sn.counts[, sn.meta$Sample]
+
+sn.meta$differentiation = sn.meta$RNA.Date
+sn.meta$rnaseq_passage = NA
+sn.meta$rnaseq_passage[sn.meta$assaypassage_rnaseq <= 25] = "low"
+sn.meta$rnaseq_passage[sn.meta$assaypassage_rnaseq > 25 & sn.meta$assaypassage_rnaseq <= 32] = "med"
+sn.meta$rnaseq_passage[sn.meta$assaypassage_rnaseq > 32] = "high"
+table(sn.meta$rnaseq_passage)
+
+sn.meta$hasDiffRep = FALSE
+diffRepDonors = unique(sn.meta$donor[sn.meta$Differentiaton.Replicate != "A"])
+sn.meta$hasDiffRep[sn.meta$donor %in% diffRepDonors] = TRUE
+
+sn.meta$differentiation = sn.meta$RNA.Date
+
+sn.meta$RIN[sn.meta$RIN == "X"] = 5
+sn.meta$RIN[is.na(sn.meta$RIN)] = 10
+sn.meta$RIN = as.numeric(sn.meta$RIN)
+sn.meta$`RNA quality` = "high"
+sn.meta$`RNA quality`[sn.meta$RIN < 8 ] = "low"
+
+sn.meta.P2 <- sn.meta %>% filter(Protocol == "P2")
+sn.meta.rep <- sn.meta %>% filter(donor %in% c("guss", "hehd", "nukw", "pelm", "podx", "qaqx"))
+rownames(sn.meta) = sn.meta$Sample
+rownames(sn.meta.rep) = sn.meta.rep$Sample
+rownames(sn.meta.P2) = sn.meta.P2$Sample
+```
+
+Run variance partitioning, including all samples except for extraction replicates, and 3 QC exclusions (posc1 - sequencing failure, iakz and koun - visually non-neuronal). Then let's see overview plots of variance explained.
+
+```{r VariancePartition.1, warning=FALSE, message=FALSE, echo=FALSE}
+sn.counts = sn.counts[, sn.meta$Sample]
+
+# Use Deseq to normalize the counts and get FPKMs
+dds = DESeqDataSetFromMatrix(countData = sn.counts,
+                             colData = sn.meta,
+                             design = ~ 1)
+# Estimate library size correction scaling factors
+dds <- estimateSizeFactors(dds)
+
+# Add gene lengths to allow for fpkm normalization
+mcols(dds)$basepairs = sn.gene.meta$length
+
+# identify genes that pass expression cutoff
+#isexpr <- rowSums(fpkm(dds)>1) >= 0.5 * ncol(dds)
+isexpr = rowMeans(fpkm(dds)) > 1
+sum(isexpr)
+
+# compute log2 Fragments Per Million
+# Alternatively, fpkm(), vst() or rlog() could be used
+quantLog.all = log2(fpkm(dds) + 1)
+quantLog <- quantLog.all[isexpr,]
+
+# Define formula
+form <- ~ (1|donor) + (1|Protocol) + (1|differentiation) + (1|gender) + (1|wasFeeder)
+#form <- ~ (1|donor) + (1|differentiation) + (1|gender) + (1|wasFeeder)
+
+# Run variancePartition analysis
+# This takes 30+ min
+#quantLog.tmp = quantLog[1:100,]
+#varPart <- fitExtractVarPartModel(quantLog.tmp, form, sn.meta)
+varPart.all <- fitExtractVarPartModel(quantLog, form, sn.meta)
+saveRDS(varPart.all, paste0(outputPath, "varPart.all.rds"))
+#varPart.all = readRDS(paste0(outputPath, "varPart.all.rds"))
+
+# sort variables (i.e. columns) by median fraction of variance explained
+vp <- sortCols( varPart.all )
+
+# violin plot of contribution of each variable to total variance
+p = plotVarPart(vp, main="120 samples, P1 and P2 protocols")
+p + theme_bw(16) + theme(legend.position="none") +
+  theme(axis.text.x=element_text(angle=0))
+
+# Redo plot ourselves to fix minor things
+doVariancePartitionPlot = function(vp, title="", residuals=T) {
+  vp2 = data.frame(vp) %>% 
+    dplyr::rename(`donor +\niPSC line`=donor) %>%
+    #dplyr::rename(differentiation=differentiation_batch) %>%
+    mutate(geneid = rownames(vp)) %>%
+    gather(variable, variance, differentiation:Residuals) %>%
+    mutate(pctvariance = variance*100)
+  
+  if (!residuals) {
+    vp2 = vp2 %>% dplyr::filter(variable != "Residuals")
+  }
+  
+  medians = vp2 %>% group_by(variable) %>% summarise(median=median(pctvariance)) %>%
+    arrange(-median) %>% filter(variable != "Residuals")
+  vp2$variable = factor(as.character(vp2$variable),
+                        levels=c(medians$variable, "Residuals"))
+  numVariables = length(levels(vp2$variable))
+  
+  gg_color_hue <- function(n) {
+    hues = seq(15, 375, length = n + 1)
+    hcl(h = hues, l = 65, c = 100)[1:n]
+  }
+  ggplot(vp2, aes(x=variable, y=pctvariance, fill=variable)) +
+    geom_violin(scale="width") +
+    geom_boxplot(width=0.07, fill="grey") +
+    theme_bw(16) +
+    ggtitle(title) +
+    theme(legend.position="none") + 
+    theme(axis.text.x=element_text(angle=0), axis.title.x=element_blank()) +
+    ylab("Variance explained (%)") + 
+    scale_fill_manual(values=c(gg_color_hue(numVariables-1), "gray85"))
+}
+
+doVariancePartitionPlot(vp, title="120 samples, P1 and P2 protocols")
+
+# Bar plot of variance fractions for the first 10 genes
+#plotPercentBars( vp[1:20,] )
+#plotPercentBars( vp[21:40,] )
+```
+
+Let's see how it differs when we consider only P2V2 samples.
+
+```{r VariancePartition.P2V2, warning=FALSE, message=FALSE, echo=FALSE}
+sn.counts.P2 = sn.counts[, sn.meta.P2$Sample]
+
+# Use Deseq to normalize the counts and get FPKMs
+dds = DESeqDataSetFromMatrix(countData = sn.counts.P2,
+                             colData = sn.meta.P2,
+                             design = ~ 1)
+# Estimate library size correction scaling factors
+dds <- estimateSizeFactors(dds)
+
+# Add gene lengths to allow for fpkm normalization
+mcols(dds)$basepairs = sn.gene.meta$length
+
+# identify genes that pass expression cutoff
+#isexpr <- rowSums(fpkm(dds)>1) >= 0.5 * ncol(dds)
+isexpr = rowMeans(fpkm(dds)) > 1
+#sum(isexpr)
+
+# compute log2 Fragments Per Million
+# Alternatively, fpkm(), vst() or rlog() could be used
+quantLog.all = log2(fpkm(dds) + 1)
+quantLog <- quantLog.all[isexpr,]
+
+# Define formula
+form <- ~ (1|donor) + (1|differentiation) + (1|gender) + (1|wasFeeder)
+
+# Run variancePartition analysis
+#quantLog.tmp = quantLog[1:100,]
+#varPart <- fitExtractVarPartModel(quantLog.tmp, form, sn.meta.P2)
+varPart.P2 <- fitExtractVarPartModel(quantLog, form, sn.meta.P2)
+saveRDS(varPart.P2, paste0(outputPath, "varPart.P2.rds"))
+#varPart.P2 = readRDS(paste0(outputPath, "varPart.P2.rds"))
+
+# sort variables (i.e. columns) by median fraction of variance explained
+vp <- sortCols( varPart.P2 )
+doVariancePartitionPlot(vp, residuals=F, title="")
+
+median(varPart.P2$differentiation)
+median(varPart.P2$donor)
+median(varPart.P2$wasFeeder)
+median(varPart.P2$gender)
+median(varPart.P2$Residuals)
+```
+
+And finally, what do we get when we include only the 6 samples for which we have 3 replicates each.
+
+```{r VariancePartition.Reps.1, warning=FALSE, message=FALSE, echo=FALSE}
+diffRepDonors.P2 = c("guss", "hehd", "nukw", "pelm", "podx", "qaqx")
+diffRepSamples.P2 = sn.meta$Sample[sn.meta$donor %in% diffRepDonors.P2]
+sn.meta.reps = sn.meta[diffRepSamples.P2, ]
+sn.counts.reps = sn.counts[ , sn.meta.reps$Sample]
+
+# Use Deseq to normalize the counts and get FPKMs
+dds = DESeqDataSetFromMatrix(countData = sn.counts.reps,
+                             colData = sn.meta.reps,
+                             design = ~ 1)
+# Estimate library size correction scaling factors
+dds <- estimateSizeFactors(dds)
+
+# Add gene lengths to allow for fpkm normalization
+mcols(dds)$basepairs = sn.gene.meta$length
+
+# identify genes that pass expression cutoff
+#isexpr <- rowSums(fpkm(dds)>1) >= 0.5 * ncol(dds)
+#isexpr = rowMeans(fpkm(dds)) > 1
+#sum(isexpr)
+
+# compute log2 Fragments Per Million
+# Alternatively, fpkm(), vst() or rlog() could be used
+quantLog <- log2(fpkm(dds)[isexpr,] + 1)
+
+# Define formula
+form <- ~ (1|donor) + (1|differentiation)
+
+# Run variancePartition analysis
+quantLog.tmp = quantLog[1:100,]
+#varPart.reps <- fitExtractVarPartModel(quantLog.tmp, form, sn.meta.reps)
+varPart.reps <- fitExtractVarPartModel(quantLog, form, sn.meta.reps)
+saveRDS(varPart.reps, paste0(outputPath, "varPart.reps.rds"))
+#varPart.reps = readRDS(paste0(outputPath, "varPart.reps.rds"))
+
+# sort variables (i.e. columns) by median fraction of variance explained
+vp <- sortCols( varPart.reps )
+# violin plot of contribution of each variable to total variance
+p = plotVarPart(vp, main="18 samples, 6 x 3 replicates each")
+p + theme_bw(16) + theme(legend.position="none")
+
+doVariancePartitionPlot(vp, title="18 samples, 6 x 3 replicates each")
+```
+

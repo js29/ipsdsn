@@ -1,0 +1,653 @@
+# MDS or PCA plots with HIPSCI IPSC, SNs, GTEx
+
+## Introduction
+
+To put the iPSC-derived sensory neurons in context, we want to cluster them with GTEx, and with iPSCs and DRG. Due to the size of the GTEx data you need at least 16 Gb RAM to run this.
+
+```{r Setup}
+library(data.table)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(gridExtra)
+library(MASS)
+library(pheatmap)
+library(stringr)
+addLabels = FALSE
+outputDir = "analysis/results/MDS/"
+outputPath = "analysis/results/MDS/"
+outputRoot = paste0(outputPath, "Clustering.gtex")
+sampleDistFile = paste0(outputRoot, ".sampledist.rds")
+mdsFitFile = paste0(outputRoot, ".isoMDSfit.rds")
+gtexRPKMData = paste0(outputPath, "gtex.df.rds")
+gtex.metaFname <- paste0(outputPath, "gtex_analysis_v6/annotations/GTEx_Data_V6_Annotations_SampleAttributesDS.txt")
+gtex.RPKMFname <- paste0(outputPath, "gtex_analysis_v6/rna_seq_data/GTEx_Analysis_v6_RNA-seq_RNA-SeQCv1.1.8_gene_rpkm.gct.gz")
+
+# Downsample to select every Nth GTEx sample during testing
+gtexSelect = 1
+pointalpha = 0.5
+```
+
+Read in the RPKM files for GTEx, the IPS-derived sensory neurons, DRG, and HIPSCI IPSCs. We keep only genes quantified in each of these sample sets (~31,000 genes).
+
+```{r LoadFilesAndGetRPKM}
+#gtex.df <- as.data.frame(fread("gunzip -c GTEx_Analysis_v6_RNA-seq_RNA-SeQCv1.1.8_gene_rpkm.subset100.gct.gz"))
+#gtex.df <- as.data.frame(fread(paste("gunzip -c", gtex.RPKMFname)))
+#saveRDS(gtex.df, gtexRPKMData)
+gtex.df <- readRDS(gtexRPKMData)
+print("Genes in GTEx:")
+dim(gtex.df)
+
+# Fix GTEx gene names to remove the version number (e.g. ".4" in ENSG00000223972.4)
+gtex.df$Name <- gsub("\\.[\\d]+", "", gtex.df$Name, perl=T)
+
+# Get metadata about GTEx samples
+sample.meta <- as.data.frame(fread(paste("cut -f 1,6,7", gtex.metaFname)))
+sample.meta[sample.meta$SMTSD == "Cells - EBV-transformed lymphocytes",]$SMTS <- "LCLs"
+rownames(sample.meta) <- sample.meta$SAMPID
+
+# A handful of GTEx samples have no tissue type in the metadata. Don't include these.
+gtex.names <- colnames(gtex.df[,-c(1,2)])
+invalid.sample.names <- gtex.names[nchar(trimws(sample.meta[gtex.names, "SMTS"])) == 0]
+colsToRemove <- which(colnames(gtex.df) %in% invalid.sample.names)
+if (length(colsToRemove) > 0) {
+  gtex.df <- gtex.df[, -colsToRemove]
+}
+print(invalid.sample.names)
+
+readRPKMTable = function(fname) {
+  # The first 2 columns are gene_id and length
+  df = readr::read_tsv(fname) %>% as.data.frame()
+  # Fix gene names to remove the version number (e.g. ".4" in ENSG00000223972.4)
+  df$gene_id <- gsub("\\.[\\d]+", "", df$gene_id, perl=T)
+  rownames(df) <- df$gene_id
+  # include gene_id
+  df[, c(1, 3:ncol(df))]
+}
+if (includeIPS) {
+  #hipsci.df.old <- read.table("../../reference/hipsci/hipsci.REL-2016-09.rpkm.txt.gz")
+  hipsciFname <- "../../hipsci/hipsci.hg37.gencode_full.rpkm.txt.gz"
+  hipsci.df <- readRPKMTable(hipsciFname)
+  hipsci.meta <- data.frame(SAMPID=colnames(hipsci.df[, -1]), SMTS="IPSC", SMTSD="IPSC")
+  sample.meta <- rbind(sample.meta, hipsci.meta)
+  
+  print("Genes in HIPSCI:")
+  print(dim(hipsci.df))
+}
+
+# We use the individual differentiations, but exclude outlier samples and exclude extraction replicates
+sn.df <- readRPKMTable("../../sn_hg37/sn.hg37.gencode_full.rpkm.txt.gz")
+colnames(sn.df) = tolower(colnames(sn.df))
+print("Genes in SNs:")
+dim(sn.df)
+
+sn.meta.all <- read.table("../data/metadata.all.txt", fill=T, header=T, stringsAsFactors=F)
+sn.meta.all$Sample = tolower(sn.meta.all$Sample)
+sn.meta.all$Protocol[grep("P2V2", sn.meta.all$Protocol)] <- "P2"
+
+# Remove outlier samples
+sn.df = sn.df %>% dplyr::select(-one_of(c("length", "posc_1", "iakz_1", "koun_2", "yuze_1_1", "yuze_1_2")))
+sn.meta.all = sn.meta.all %>% dplyr::filter(! Sample %in% c("posc_1", "iakz_1", "koun_2", "yuze_1_1", "yuze_1_2"))
+
+# Remove extraction replicates
+sn.meta.all = sn.meta.all[!sn.meta.all$Extraction.Replicate == "B",]
+sn.df = sn.df[, c("gene_id", sn.meta.all$Sample)]
+
+rownames(sn.meta.all) <- sn.meta.all$Sample
+smts <- paste("IPSDSN", sn.meta.all[colnames(sn.df)[-1], "Protocol"])
+sn.meta <- data.frame(SAMPID=colnames(sn.df)[-1], SMTS=smts, SMTSD=smts)
+
+drg.df <- readRPKMTable("../../drg/drg.hg37.gencode_full.rpkm.txt.gz")
+print("Genes in DRGs:")
+dim(drg.df)
+drg.meta.all = readr::read_csv("../../drg/drg.sample_data.csv")
+drg.meta <- data.frame(SAMPID=colnames(drg.df[, -1]), SMTS="DRG", SMTSD="DRG")
+# Exclude the DRG outlier sample
+drg.meta = drg.meta %>% filter(SAMPID != "T32053")
+drg.df = drg.df[, c("gene_id", as.character(drg.meta$SAMPID))]
+
+sample.meta <- rbind(sample.meta, sn.meta, drg.meta)
+rownames(sample.meta) <- sample.meta$SAMPID
+
+gtexNsamples <- ncol(gtex.df) - 2
+
+rpkm.df <- gtex.df[, -2]
+rm(gtex.df)
+gc()
+print("Genes after merging GTEx with HIPSCI:")
+rpkm.df <- dplyr::inner_join(rpkm.df, hipsci.df, c("Name" = "gene_id"))
+print(dim(rpkm.df))
+gc()
+
+print("Genes after merging with DRGs:")
+rpkm.df <- dplyr::inner_join(rpkm.df, drg.df, c("Name" = "gene_id"))
+dim(rpkm.df)
+
+print("Genes after merging with SNs:")
+rpkm.df <- dplyr::inner_join(rpkm.df, sn.df, c("Name" = "gene_id"))
+dim(rpkm.df)
+gc()
+rownames(rpkm.df) = rpkm.df$Name
+
+#write.table(sample.meta, paste0(outputPath, "rpkms.sample_meta.txt"), quote=F, row.names=T, col.names=T, sep="\t")
+#sample.meta = read.delim(paste0(outputPath, "rpkms.sample_meta.txt"))
+#saveRDS(rpkm.df, paste0(outputPath, "rpkms.gtex.ips.drg.sn.rds"))
+#rownames(sample.meta) = sample.meta$SAMPID
+#rpkm.df = readRDS(paste0(outputPath, "rpkms.gtex.ips.drg.sn.rds"))
+```
+
+***Added 2017-08
+To get around differences in quantification between GTEx (RNASeQC) and our samples (featureCounts, IPSDSNs, iPSCs, DRG), I want to use PCA rather than MDS. This will allow me to define axes of variation using only the GTEx samples, and then determine where our samples fall on these axes.
+
+```{r CalcPCA}
+library(bigalgebra)
+library(irlba)
+library(bigpca)
+sample.meta = read.delim(paste0(outputPath, "rpkms.sample_meta.txt"))
+rpkm.df = readRDS(paste0(outputPath, "rpkms.gtex.ips.drg.sn.rds"))
+
+gtexNsamples = sum(grepl("GTEX", colnames(rpkm.df)))
+gtexSelect = 1
+gtexCols = seq(2, gtexNsamples+1, gtexSelect)
+sample.names <- colnames(rpkm.df)
+
+# Identify genes that are not expressed at all in our samples - these are
+# probably technical differences and so not informative.
+nongtex.df = as.matrix(rpkm.df[, seq(gtexNsamples+1, ncol(rpkm.df))])
+numSamplesExpressingGene.nongtex = apply(nongtex.df, 1, FUN = function(x) sum(x > 0))
+
+# Identify genes that are lowly expressed across all GTEx samples, as these
+# aren't of interest. Reducing the size of the dataset will make this feasible
+# to run.
+gtex.df = as.matrix(rpkm.df[, gtexCols])
+rm(rpkm.df)
+gc()
+numSamplesExpressingGene.gtex = apply(gtex.df, 1, FUN = function(x) sum(x > 0.1))
+#hist(numSamplesExpressingGene.gtex, breaks=50)
+#hist(numSamplesExpressingGene.gtex[numSamplesExpressingGene.gtex < 50], breaks=50)
+#lowExprGenes = names(numSamplesExpressingGene.gtex[numSamplesExpressingGene.gtex < 50])
+genesToUse = names(numSamplesExpressingGene.gtex[numSamplesExpressingGene.gtex >= 50 & numSamplesExpressingGene.nongtex > 0])
+
+gtex.df = gtex.df[genesToUse, ]
+gc()
+rpkm.log.mat <- as.matrix(log2(gtex.df + 1))
+saveRDS(rpkm.log.mat, file=paste0(outputPath, "gtex.rpkm.log.mat.rds"))
+rm(gtex.df)
+gc()
+gtex.rpkm.log.exprmeans = rowMeans(rpkm.log.mat)
+
+# Save the matrix to a big.matrix file, to save memory while we're running
+# the bigpca.
+#bmat <- as.big.matrix(t(rpkm.log.mat), backingfile="rpkm.log.mat.bck", descriptorfile="rpkm.log.mat.dsc", backingpath=outputDir)
+bmat2 <- attach.big.matrix("rpkm.log.mat.dsc", path=outputDir)
+
+rm(rpkm.log.mat)
+gc()
+system.time( result <- big.PCA(bmat2, pcs.to.keep=5, return.loadings=T, verbose=T, use.bigalgebra=T) )
+saveRDS(result, file=paste0(outputPath, "bigPCA.result.rds"))
+#result = readRDS(paste0(outputPath, "bigPCA.result.rds"))
+
+View(result$PCs)
+View(result$loadings)
+
+# pcares = data.frame(result$loadings)
+# pcares$SAMPID = rownames(pcares)
+# pcares = pcares %>% left_join(sample.meta, by="SAMPID")
+# ggplot(pcares, aes(x=PC1, y=PC2, col=SMTS)) + geom_point(alpha=pointalpha)
+
+# Get PC loadings for all samples, including GTEx
+# For some unknown reason, the PC loadings reported in the bigpca result
+# do not correspond with what you get when you multiple the input data
+# by the PCs. I couldn't figure out any scaling that would make it so!
+# But you get exactly the same plot / relative PC loadings when you
+# do this multiplication yourself for the GTEx samples. This way I can
+# finally put our in-house samples on the same scale as GTEx.
+rpkm.df = readRDS(paste0(outputPath, "rpkms.gtex.ips.drg.sn.rds"))[,-1]
+rpkm.df = rpkm.df[genesToUse,]
+gc()
+all.rpkm.log.mat <- as.matrix(log2(rpkm.df + 1))
+all.rpkm.log.mat.norm = t(all.rpkm.log.mat - gtex.rpkm.log.exprmeans)
+all.loadings = all.rpkm.log.mat.norm %*% result$PCs
+all.res = data.frame(all.loadings)
+all.res$SAMPID = rownames(all.loadings)
+all.res = all.res %>% left_join(sample.meta, by="SAMPID")
+
+# Determine center of each tissue
+getTissueLoc = function(df, col1, col2) {
+  tissues <- unique(na.omit(df$SMTS))
+  tissueLoc <- data.frame(x=numeric(), y=numeric())
+  for (tissue in tissues) {
+    meanx <- mean(df[df$SMTS == tissue, col1])
+    meany <- mean(df[df$SMTS == tissue, col2])
+    tissueLoc[tissue, c("x", "y")] <- c(meanx, meany)
+  }
+  tissueLoc
+}
+# Output tissue centers
+print("Tissue centers:")
+tissueLoc
+
+all.res$SMTS = factor(all.res$SMTS, levels=unique(as.character(all.res$SMTS)))
+all.res$shape = "GTEx"
+all.res$shape[all.res$SMTS == "IPSDSN P1"] = "IPSDSN P1"
+all.res$shape[all.res$SMTS == "IPSDSN P2"] = "IPSDSN P2"
+
+# Set up colors so that we can give IPSDSN P1 and P2 samples distinct colors
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+smts = unique(all.res$SMTS)
+colorScale = gg_color_hue(length(smts))
+# Since IPSDSN don't overlap with Colon / Pituitary using the same colors should be okay
+colorScale[smts == "IPSDSN P1"] = colorScale[smts == "Colon"]
+colorScale[smts == "IPSDSN P2"] = colorScale[smts == "Pituitary"]
+colorScale[smts == "IPSC"] = colorScale[smts == "Blood Vessel"]
+
+tissueLoc = getTissueLoc(all.res, "PC1", "PC2")
+p <- ggplot(all.res, aes(x=PC1, y=PC2, col=SMTS, shape=shape)) +
+  geom_point(alpha=pointalpha, size=2.5) +
+  geom_point(data=all.res[grepl("IPSDSN|DRG|IPSC", all.res$SMTS),], alpha=0.6, size=3.2) +
+  scale_color_manual(guide=F, values=colorScale) +
+  scale_shape_discrete(guide=F) +
+  theme_classic(16) +
+  coord_cartesian(xlim=c(-50, 137))
+print(p)
+
+#### Plot for paper Figure
+pdf(paste0(outputRoot, ".pdf"), width=10, height=7)
+print(p)
+dev.off()
+
+pdf(paste0(outputRoot, ".withLabels.pdf"), width=10, height=7)
+print(p + annotate("text", x=tissueLoc$x, y=tissueLoc$y, label=rownames(tissueLoc), size=3))
+dev.off()
+```
+
+To make an MDS plot, start by getting sample distances the same way that GTEx did, as 1 - cor (pearson).
+Then use isoMDS to do a 2-d multidimensional scaling.
+
+```{r CalculateSampleDistance}
+rpkm.df = na.omit(rpkm.df)
+gc()
+rpkm.log.mat <- log2(rpkm.df[, -1] + 1)
+rownames(rpkm.log.mat) <- rpkm.df$Name
+gc()
+
+snNsamples <- ncol(sn.df) - 1
+drgNsamples <- ncol(drg.df) - 1
+gtexNsamples = sum(grepl("GTEX", colnames(rpkm.df)))
+
+totalNsamples = gtexNsamples + snNsamples + drgNsamples
+if (includeIPS) {
+  hipsciNsamples <- dim(hipsci.df)[2] - 1
+  totalNsamples <- totalNsamples + hipsciNsamples
+}
+rm(rpkm.df, sn.df, drg.df, hipsci.df)
+gc()
+
+gtexCols = seq(1, gtexNsamples, gtexSelect)
+
+colsToSelect = c(gtexCols, seq(gtexNsamples+1, totalNsamples))
+print("Selecting columns:")
+colsToSelect
+
+sample.names <- colnames(rpkm.log.mat)[colsToSelect]
+# A handful of samples have no tissue type in the metadata. Don't include these
+tissues <- sample.meta[sample.names, "SMTS"]
+
+if (file.exists(mdsFitFile)) {
+  print(paste("Reading file:", mdsFitFile))
+  fit <- readRDS(mdsFitFile)
+} else {
+  if (sampleDistFile != "NA" & file.exists(sampleDistFile)) {
+    print(paste("Reading file:", sampleDistFile))
+    d <- readRDS(sampleDistFile)
+  } else {
+    system.time(d <- 1 - cor(rpkm.log.mat[,sample.names]))  
+    saveRDS(d, paste0(outputRoot, ".sampledist.rds"))
+  }
+  
+  print("Calculating isoMDS")
+  system.time(fit <- isoMDS(d, k=2)) # k is the number of dim
+  saveRDS(fit, paste0(outputRoot, ".isoMDSfit.rds"))
+}
+```
+
+Plot the result. Also save a table with the coordinates of the samples, as well as the center for each tissue's set of samples.
+
+```{r Plot}
+# plot solution 
+x <- fit$points[,1]
+y <- fit$points[,2]
+#plot(x, y, xlab="Coordinate 1", ylab="Coordinate 2", main="Nonmetric MDS")
+
+library(ggplot2)
+sample.names <- colnames(rpkm.log.mat)[colsToSelect]
+tissues <- sample.meta[sample.names, "SMTS"]
+
+plot.df <- data.frame(coord1=x, coord2=y, tissue=tissues)
+write.table(plot.df, paste0(outputRoot, ".plot.df.txt"), col.names=T, row.names=F, quote=F, sep="\t")
+#plot.df = read.delim(paste0(outputRoot, ".plot.df.txt"), sep="\t")
+plot.df$isGTEx = "GTEx"
+plot.df$isGTEx[(gtexNsamples+1):nrow(plot.df)] = "In-house"
+
+# Determine center of each tissue
+tissueLoc <- data.frame(x=numeric(), y=numeric())
+for (tissue in unique(na.omit(tissues))) {
+  meanx <- mean(plot.df$coord1[plot.df$tissue == tissue])
+  meany <- mean(plot.df$coord2[plot.df$tissue == tissue])
+  tissueLoc[tissue, c("x", "y")] <- c(meanx, meany)
+}
+# Output tissue centers
+print("Tissue centers:")
+tissueLoc
+
+pdf(paste0(outputRoot, ".pdf"), width=10, height=7)
+p <- ggplot(plot.df, aes(x=coord1, y=coord2, col=tissue, shape=isGTEx)) +
+geom_point(alpha=pointalpha, size=2.5) +
+scale_color_discrete(guide=F) +
+theme_classic(16) +
+theme(legend.position=c(0.15,0.85), legend.title = element_blank(), legend.text = element_text(size=16)) +
+xlab("Coordinate 1") + ylab("Coordinate 2")
+if (addLabels) {
+  p <- p + annotate("text", x=tissueLoc$x, y=tissueLoc$y, label=rownames(tissueLoc), size=3)
+}
+print(p)
+dev.off()
+```
+
+Let's now do hierarchical clustering of the tissues in the same way that GTEx did - with hclust where each tissue is represented by the median gene expression across its samples for each gene.
+First we see what it looks like when using all genes (~56,000).
+
+```{r Clustering}
+sample.meta = read.delim(paste0(outputPath, "rpkms.sample_meta.txt"))
+rownames(sample.meta) <- sample.meta$SAMPID
+# Fix a few metadata issues
+#sample.meta[sample.meta$SMTS == "" & sample.meta$SMTSD == "Stomach",]$SMTS = "Stomach"
+#sample.meta[sample.meta$SMTS == "" & sample.meta$SMTSD == "Esophagus - Mucosa",]$SMTS = "Esophagus"
+#sample.meta[sample.meta$SMTS == "" & sample.meta$SMTSD == "Skin - Sun Exposed (Lower leg)",]$SMTS = "Skin"
+
+sample.meta$SMTS = as.character(sample.meta$SMTS)
+#sample.meta[sample.meta$SMTS == "Sensory neuron P1",]$SMTS = "IPSDSN P1"
+#sample.meta[sample.meta$SMTS == "Sensory neuron P2",]$SMTS = "IPSDSN P2"
+
+# Convert from log RPKM to plain RPKM
+#rpkm.mat <- as.matrix(rpkm.df[, -1])
+rpkm.mat = exp(rpkm.log.mat) - 1
+#rm(rpkm.log.mat)
+gc()
+
+# Go through each GTEx tissue and determine the median RPKM for each gene.
+# Using the mean gives very similar results
+sample.names <- colnames(rpkm.mat)
+getMedianRPKMs = function(tissue) {
+  apply(rpkm.mat[, rpkm.df.tissues == tissue], 1, median)
+}
+getMeanRPKMs = function(tissue) {
+  rowMeans(rpkm.mat[, rpkm.df.tissues == tissue])
+}
+
+# Use SMTS (simple tissue category)
+rpkm.df.tissues <- sample.meta[sample.names, "SMTS"]
+means.df.smts = as.data.frame(lapply(unique(rpkm.df.tissues), getMeanRPKMs))
+colnames(means.df.smts) = unique(rpkm.df.tissues)
+
+rpkm.df.tissues <- sample.meta[sample.names, "SMTSD"]
+means.df.smtsd = as.data.frame(lapply(unique(rpkm.df.tissues), getMeanRPKMs))
+colnames(means.df.smtsd) = unique(rpkm.df.tissues)
+
+# Pearson correlation gives similar results, so we just use spearman
+cor.pearson = cor(log(means.df.smts + 0.1))
+head(cor.pearson[order(-cor.pearson[,"IPSDSN P2"]), "IPSDSN P2"])
+# d <- as.dist(1 - cor.pearson, diag=F)
+# hc = hclust(d, method="complete")
+# plot(hc, hang=0.1, ylab="Distance between clusters")
+# pheatmap(cor.pearson)
+
+cor.spearman = cor(means.df.smts, method = "spearman")
+head(cor.spearman[order(-cor.spearman[,"IPSDSN P2"]), "IPSDSN P2"])
+
+d <- as.dist(1 - cor.spearman, diag=F)
+hc = hclust(d, method="complete")
+plot(hc, hang=0.1, ylab="Distance between clusters")
+pheatmap(cor.spearman)
+
+pdf(paste0(outputPath, "clustering.all_genes.pdf"), width=10, height=7)
+# For paper, save PDF at 13.5 x 7
+par(mar=c(0.5,4.1,0.5,0.5)) 
+plot(hc, hang=0.1, cex=1.5, cex.axis=1.3, cex.lab=1.3, ann = F)
+title(ylab = "Distance between clusters", cex.lab=1.3, line = 2.5)
+dev.off()
+
+pdf(paste0(outputPath, "clustering.heatmap.all_genes.pdf"), width=10, height=7)
+pheatmap(cor.spearman)
+dev.off()
+```
+
+Let's include the single cell gene expression profiles for comparison.
+
+```{r Clustering.singlecell.1}
+options(stringsAsFactors=F)
+sn.df <- read.table("../data/singleCellCounts.txt", header=T, comment.char="#")
+sn.df = sn.df[rowSums(sn.df[,-(1:6)]) != 0, ]
+annotation = sn.df[,1:6]
+rownames(sn.df) <- sn.df$Geneid
+counts = as.matrix(sn.df[,-(1:6)])
+
+cellids <- str_extract(colnames(counts), 'Batch[\\d]*\\.[\\w]+')
+cellids <- as.vector(lapply(cellids, function(x) {substr(x, 6, nchar(x))}), mode="character")
+
+cellmeta.all <- data.frame(cellid=cellids, details=colnames(counts))
+rownames(cellmeta.all) <- as.character(cellmeta.all$cellid)
+cellmeta.all$totalcount <- colSums(counts)
+# Update the cell IDs to be the simple 1.A8, rather than the long detailed name
+colnames(counts) <- cellids
+cellmeta.all$propexpressed <- apply(counts[rowSums(counts) > 0,], 2, function(x) {sum(x>0) / length(x)})
+selectedCells <- (cellmeta.all$propexpressed > 0.2 & !grepl("Pos", cellmeta.all$cellid))
+counts = counts[, selectedCells]
+# After excluding cells with < 20% of genes expressed, we have 177 cells.
+cellmeta <- cellmeta.all[selectedCells, ]
+
+clusters.df <- read.delim("../results/sc3/sc3results/sc3_cell_clusters.v2.txt")
+cellmeta.clust <- merge(cellmeta, clusters.df, by="cellid")
+rownames(cellmeta.clust) <- cellmeta.clust$cellid
+cellmeta.clust$k2_cluster <- as.character(cellmeta.clust$k2_cluster)
+
+neuron.cols <- which(cellmeta.clust$k2_cluster == 1)
+fibroblast.cols <- which(cellmeta.clust$k2_cluster == 2)
+# Average counts from all fibroblast cells and neuronal cells
+allgenes.counts <- counts[, cellmeta.clust$cellid]
+fibroblast.avg = rowMeans(allgenes.counts[,fibroblast.cols])
+neuron.avg = rowMeans(allgenes.counts[,neuron.cols])
+singleCellTypes.df = data.frame(sc.fibroblast=fibroblast.avg, sc.neuron=neuron.avg)
+singleCellTypes.df$Geneid = rownames(allgenes.counts)
+rownames(singleCellTypes.df) = singleCellTypes.df$Geneid
+singleCellTypes.df = dplyr::inner_join(singleCellTypes.df, annotation[, c("Geneid", "Length")], by=c("Geneid" = "Geneid") )
+
+countsToRPKM = function(df, geneLengths) {
+  apply(df, MARGIN=2, FUN=function(x) (x / sum(x)) / geneLengths * 1e6 * 1e3)
+}
+singleCellTypes.rpkm = as.data.frame(countsToRPKM(singleCellTypes.df[,1:2], singleCellTypes.df$Length))
+singleCellTypes.rpkm = cbind(data.frame(Geneid=singleCellTypes.df$Geneid), singleCellTypes.rpkm)
+gc()
+
+# Merge single cell RPKMs with tissue RPKMs
+means.df.smtsd$Geneid = rownames(means.df.smtsd)
+tissue.rpkms = dplyr::inner_join(singleCellTypes.rpkm, means.df.smtsd, by="Geneid")
+rownames(tissue.rpkms) = tissue.rpkms$Geneid
+
+gtex.tissue.names = data.frame(ts=unique(sample.meta$SMTSD)) %>%
+filter(!ts %in% c("IPSC", "IPSDSN P1", "IPSDSN P2", "DRG", "sc.neuron", "sc.fibroblast")) %>% .$ts
+our.tissue.names = c("IPSC", "IPSDSN P1", "IPSDSN P2", "DRG", "sc.neuron", "sc.fibroblast")
+tissue.rpkms.gtex = tissue.rpkms[, gtex.tissue.names]
+tissue.rpkms.ours = tissue.rpkms[, our.tissue.names]
+expressedGenes = apply(tissue.rpkms.gtex[,-1], 1, FUN=function(x) sum(x>0) > 1) & apply(tissue.rpkms.ours, 1, FUN=function(x) sum(x>0) > 1) 
+sum(expressedGenes)
+tissue.rpkms.expr = tissue.rpkms[expressedGenes,-1]
+
+cor.pearson = cor(log(tissue.rpkms.expr + 1))
+head(cor.pearson[order(-cor.pearson[,"sc.neuron"]), "sc.neuron"])
+head(cor.pearson[order(-cor.pearson[,"sc.fibroblast"]), "sc.fibroblast"])
+head(cor.pearson[order(-cor.pearson[,"IPSDSN P2"]), "IPSDSN P2"])
+head(cor.pearson[order(-cor.pearson[,"IPSDSN P2"]), "IPSDSN P2"])
+
+cor.spearman = cor(tissue.rpkms.expr, method = "spearman")
+head(cor.spearman[order(-cor.spearman[,"sc.neuron"]), "sc.neuron"])
+head(cor.spearman[order(-cor.spearman[,"sc.fibroblast"]), "sc.fibroblast"])
+head(cor.spearman[order(-cor.spearman[,"IPSDSN P2"]), "IPSDSN P2"])
+head(cor.spearman[order(-cor.spearman[,"IPSDSN P2"]), "IPSDSN P2"])
+
+d <- as.dist(1 - cor.spearman, diag=F)
+hc = hclust(d, method="complete")
+plot(hc, hang=0.1, ylab="Distance between clusters")
+pheatmap(cor.spearman)
+
+pdf(paste0(outputPath, "clustering.all_genes.sc.pdf"), width=10, height=7)
+# For paper, save PDF at 13.5 x 7
+par(mar=c(0.5,4.1,0.5,0.5)) 
+plot(hc, hang=0.1, cex=1.5, cex.axis=1.3, cex.lab=1.3, ann = F)
+title(ylab = "Distance between clusters", cex.lab=1.3, line = 2.5)
+dev.off()
+
+pdf(paste0(outputPath, "clustering.heatmap.all_genes.sc.pdf"), width=10, height=7)
+pheatmap(cor.spearman)
+dev.off()
+
+# Supplementary figure
+pdf(paste0(outputPath, "clustering.heatmap.all_genes.sc.pdf"), width=6, height=6)
+cor.spearman = cor(tissue.rpkms.expr %>%
+rename(`Cells - fibroblast` = `Cells - Transformed fibroblasts`)
+, method = "spearman")
+
+selectedTissues = c("IPSDSN P1", "IPSDSN P2", "DRG", "IPSC", "Brain - Cortex", "Nerve - Tibial", "Cells - fibroblast", "sc.neuron", "sc.fibroblast")
+cor.spearman.sel = cor.spearman[selectedTissues, selectedTissues]
+pheatmap(cor.spearman.sel, show_colnames = T, show_rownames = T, fontsize=9, display_numbers = T, number_format = "%.2f", fontsize_number=9,
+cluster_cols = F, cluster_rows = F, legend = F, main="Tissue correlation-genome wide")
+dev.off()
+```
+
+Look at distribution of expression of sensory neuronal marker genes.
+
+```{r MarkerGeneExpr}
+# SCN9A, ISL1, NGFR, DRGX
+options(stringsAsFactors = F)
+genenames.df = read.delim("../reference/ENSG81.HGNC.uniq.txt")
+genenames.df = genenames.df %>% dplyr::distinct(HGNC_symbol, .keep_all = T)
+
+markers.hgnc = c("SCN9A", "ISL1", "NGFR", "DRGX", "CHRNB2", "PIEZO2", "TUBA1A", "PRPH")
+rownames(genenames.df) = genenames.df$HGNC_symbol
+markers.ensg = genenames.df[markers.hgnc,]$Ensembl_Gene_ID
+
+tissueToPlot = c("IPSDSN", "IPSC", "DRG", "Brain", "Nerve")
+markers.df = as.data.frame(t(rpkm.log.mat[markers.ensg,]))
+#markers.df = as.data.frame(t(log(rpkm.mat[markers.ensg,] + 1)))
+#markers.df = as.data.frame(t(rpkm.mat))
+colnames(markers.df) = markers.hgnc
+markers.df$sample = rownames(markers.df)
+markers.df$tissue = as.character(sample.meta[rownames(markers.df),]$SMTS)
+markers.df$tissue[markers.df$tissue %in% c("IPSDSN P1", "IPSDSN P2")] = "IPSDSN"
+markers.df$tissue[!markers.df$tissue %in% tissueToPlot] = "Other GTEx"
+markers.df$tissue = factor(markers.df$tissue, levels=c(tissueToPlot, "Other GTEx"))
+#View(markers.df[markers.df$tissue == "IPSDSN",])
+
+markers.df.plot = tidyr::gather(markers.df, "gene", "logrpkm", 1:8)
+
+pdf(paste0(outputPath, "markergene.expression.pdf"), width=8, height=8)
+
+p1 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[1],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+theme(axis.title.y = element_text(size=16), plot.title = element_text(size=20)) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none") +
+labs(y="log(RPKM + 1)", title=markers.hgnc[1])
+
+p2 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[2],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+theme(axis.title.y = element_text(size=16), plot.title = element_text(size=20)) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none") +
+labs(y="log(RPKM + 1)", title=markers.hgnc[2])
+
+p3 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[3],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+theme(axis.title.y = element_text(size=16), plot.title = element_text(size=20)) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none") +
+labs(y="log(RPKM + 1)", title=markers.hgnc[3])
+
+p4 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[4],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+theme(axis.title.y = element_text(size=16), plot.title = element_text(size=20)) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none") +
+labs(y="log(RPKM + 1)", title=markers.hgnc[4])
+
+grid.arrange(grobs=list(p1, p2, p3, p4), ncol=2)
+
+p5 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[5],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+labs(y="log(RPKM + 1)", title=markers.hgnc[5]) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none")
+
+p6 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[6],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+labs(y="log(RPKM + 1)", title=markers.hgnc[6]) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none")
+
+p7 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[7],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+labs(y="log(RPKM + 1)", title=markers.hgnc[7]) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none")
+
+p8 = ggplot(markers.df.plot[markers.df.plot$gene == markers.hgnc[8],], aes(factor(tissue), logrpkm, fill=factor(tissue))) +
+geom_violin(scale = "width") +
+theme_bw(18) +
+labs(y="log(RPKM + 1)", title=markers.hgnc[8]) +
+theme(axis.text.x=element_text(angle = 45, hjust = 1), axis.title.x=element_blank(), legend.position="none")
+
+grid.arrange(grobs=list(p5, p6, p7, p8), ncol=2)
+
+dev.off()
+```
+
+Let's make a different view of the expression of key marker genes for a paper Figure.
+
+```{r MarkerGeneExpr.2}
+markers.hgnc = c("SCN9A", "DRGX", "NANOG", "POU5F1")
+rownames(genenames.df) = genenames.df$HGNC_symbol
+# The gene names table has the wrong ID for OCT4 / POU5F1
+genenames.df["POU5F1",]$Ensembl_Gene_ID = "ENSG00000204531"
+markers.ensg = genenames.df[markers.hgnc,]$Ensembl_Gene_ID
+
+tissueToPlot = c("IPSDSN", "IPSC", "DRG")
+markers.df = as.data.frame(t(rpkm.log.mat[markers.ensg,]))
+colnames(markers.df) = markers.hgnc
+markers.df$sample = rownames(markers.df)
+markers.df$tissue = as.character(sample.meta[rownames(markers.df),]$SMTS)
+markers.df$tissue[markers.df$tissue %in% c("IPSDSN P1", "IPSDSN P2")] = "IPSDSN"
+markers.df = markers.df[markers.df$tissue %in% tissueToPlot,]
+markers.df$tissue = factor(markers.df$tissue, levels=c(tissueToPlot))
+#View(markers.df[markers.df$tissue == "IPSDSN",])
+
+markers.df.plot = tidyr::gather(markers.df, "gene", "logrpkm", 1:length(markers.hgnc))
+markers.df.plot$gene = factor(markers.df.plot$gene, levels=markers.hgnc)
+
+pdf(paste0(outputPath, "markergene.expression.2.pdf"), width=4.5, height=8)
+
+markers.df.plot2 = markers.df.plot[markers.df.plot$gene %in% markers.hgnc,]
+markers.df.plot2$`log(FPKM + 1)` = markers.df.plot2$logrpkm
+ggplot(markers.df.plot2, aes(factor(tissue), `log(FPKM + 1)`, fill=factor(tissue))) +
+  geom_violin(scale = "width") +
+  theme_bw(18) + coord_flip() +
+  theme(axis.title.y=element_blank(), legend.position="none") +
+  facet_wrap(~gene, ncol=1) +
+  theme(strip.background = element_rect(fill="white", linetype="blank"), strip.text = element_text(size=16), strip.switch.pad.wrap=unit(0, "cm")) +
+  theme(panel.spacing = unit(0.0, "cm"))
+
+dev.off()
+```
+

@@ -1,0 +1,159 @@
+# Analysis of replicate RNA-seq samples
+
+## Introduction
+A total of 131 RNA-seq samples from IPS-derived sensory neurons were available. 8 of these were RNA-extraction replicates, i.e. from the same differentiated cell line. 20 of these were differentiation replicates. (8 individuals had 3 differentiations, 1 had 2 differentiations, and 1 had 4.) We want to compare the variability in gene expression between replicates and between different donors.
+
+```{r Setup}
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(dplyr)
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r LoadFiles}
+meta  = read.delim("../data/metadata.all.txt", stringsAsFactors = FALSE)
+meta$Sample = tolower(meta$Sample)
+
+# Exclude low quality and outlier samples
+meta = meta %>% dplyr::filter(! Sample %in% c("posc_1", "iakz_1", "koun_2", "yuze_1_1", "yuze_1_2"))
+rownames(meta) = meta$Sample
+
+#count.df <- read.delim("../data/all_basic_counts.v5.txt")
+expr.data <- readRDS("../data/combined_expression_data.v5.rds")
+colnames(expr.data$exprs_cqn) <- tolower(colnames(expr.data$exprs_cqn))
+
+extraction.rep.pairs <- read.delim("results/replicates/extraction_replicate_pairs.txt")
+differentiation.rep.pairs <- read.delim("results/replicates/differentiation_replicate_pairs.txt")
+ips_protocol.rep.pairs <- read.delim("results/replicates/ips_replicate_pairs.txt")
+
+extraction.rep.pairs$protocol1 = meta[extraction.rep.pairs$sample1, "Protocol"]
+extraction.rep.pairs$protocol2 = meta[extraction.rep.pairs$sample2, "Protocol"]
+
+differentiation.rep.pairs$protocol1 = meta[differentiation.rep.pairs$sample1, "Protocol"]
+differentiation.rep.pairs$protocol2 = meta[differentiation.rep.pairs$sample2, "Protocol"]
+differentiation.rep.pairs.P2V2 = differentiation.rep.pairs %>% filter(protocol1 == "P2V2", protocol2 == "P2V2")
+
+# Make a dataframe with all possible cross-donor sample pairs
+different.donor.pairs <- expand.grid(meta$Sample, meta$Sample)
+different.donor.pairs <- cbind(different.donor.pairs, expand.grid(meta$donor, meta$donor))
+colnames(different.donor.pairs) <- c("sample1", "sample2", "donor1", "donor2")
+# Remove pairs that were different samples from the same donor
+different.donor.pairs <- different.donor.pairs[different.donor.pairs$donor1 != different.donor.pairs$donor2,]
+different.donor.pairs.P1 <- different.donor.pairs[meta[different.donor.pairs$sample1, "Protocol"] == "P1" & meta[different.donor.pairs$sample2, "Protocol"] == "P1",]
+different.donor.pairs.P2 <- different.donor.pairs[meta[different.donor.pairs$sample1, "Protocol"] == "P2V2" & meta[different.donor.pairs$sample2, "Protocol"] == "P2V2",]
+different.donor.pairs.all = different.donor.pairs
+
+plotReplicatePair <- function(sample1, sample2, textsize, downsample) {
+  df <- data.frame(x=expr.data$exprs_cqn[,sample1], y=expr.data$exprs_cqn[,sample2])
+  spearman.cor <- cor(df$x, df$y, method="spearman")
+  
+  if (downsample) {
+    # Order genes by mean CQN expression (highest first)
+    df$m = apply(df, 1, mean)
+    df <- df[order(-df$m),]
+    # Sample the top 1000 genes, and 1/20 of the remaining
+    N <- dim(df)[1]
+    downsample = c(1:1000, sample(1001:N, as.integer((N-1000)/20)))
+    df <- df[downsample,]
+  }
+  p <- ggplot(df, aes(x=x, y=y)) + geom_point(size=0.5)
+  p <- p + theme_bw(textsize) + xlab(sample1) + ylab(sample2)
+  p <- p + annotate("text", -3, 10, label=sprintf("cor=%.2f", spearman.cor), size=4, col="blue")
+  list(plot=p, spearman.cor=spearman.cor)
+}
+```
+
+Plot RNA extraction replicates against each other.
+
+```{r PlotReplicates}
+############## Make plots, downsampled to have fewer points
+downsample = T
+
+Nreplicates <- dim(extraction.rep.pairs)[1]
+extraction.rep.pairs$spearman.cor = NA
+plots <- list()
+for (i in 1:Nreplicates) {
+  result <- plotReplicatePair(extraction.rep.pairs[i,1], extraction.rep.pairs[i,2], 14, downsample)
+  extraction.rep.pairs$spearman.cor[i] = result$spearman.cor
+  plots <- c(plots, list(result$plot))
+}
+do.call(grid.arrange, c(plots, list(top=textGrob("Extraction replicates - normalized expression", gp=gpar(fontsize=16,fontface="bold")), nrow=3)))
+
+print(median(extraction.rep.pairs$spearman.cor))
+```
+
+We see above that for RNA extraction replicates the median spearman correlation coefficient is 0.98.
+
+```{r PlotReplicates2}
+Nreplicates <- dim(differentiation.rep.pairs.P2V2)[1]
+differentiation.rep.pairs.P2V2$spearman.cor = NA
+plots <- list()
+for (i in 1:Nreplicates) {
+  result <- plotReplicatePair(differentiation.rep.pairs.P2V2[i,1], differentiation.rep.pairs.P2V2[i,2], 12, downsample)
+  differentiation.rep.pairs.P2V2$spearman.cor[i] = result$spearman.cor
+  plots <- c(plots, list(result$plot))
+}
+do.call(grid.arrange, c(plots, list(top=textGrob("Differentiation replicates - normalized expression", gp=gpar(fontsize=16,fontface="bold")), ncol=5)))
+
+print(median(differentiation.rep.pairs.P2V2$spearman.cor))
+```
+
+For differentiation replicates the median spearman correlation coefficient is 0.96.
+
+```{r PlotReplicates3}
+Nreplicates <- dim(ips_protocol.rep.pairs)[1]
+ips_protocol.rep.pairs$spearman.cor = NA
+plots <- list()
+for (i in 1:Nreplicates) {
+  result <- plotReplicatePair(ips_protocol.rep.pairs[i,1], ips_protocol.rep.pairs[i,2], 12, downsample)
+  ips_protocol.rep.pairs$spearman.cor[i] = result$spearman.cor
+  plots <- c(plots, list(result$plot))
+}
+do.call(grid.arrange, c(plots, list(top=textGrob("IPS replicates (feeder/feeder-free, P1/P2V2) - normalized expression", gp=gpar(fontsize=16,fontface="bold")), ncol=2)))
+```
+
+```{r PlotReplicates4}
+# Sample a subset of all possible P2V2 pairs of different donors
+different.donor.pairs = different.donor.pairs.P2[sample(1:nrow(different.donor.pairs.P2), 100, replace=F),]
+different.donor.pairs = different.donor.pairs.P2
+# With the full set of pairwise correlations this takes a couple of hours
+
+Nreplicates <- dim(different.donor.pairs)[1]
+different.donor.pairs$spearman.cor = NA
+plots <- list()
+for (i in 1:Nreplicates) {
+  if (i %% 500 == 0) {
+    print(paste(i, "/", Nreplicates, "replicates completed"))
+  }
+  result <- plotReplicatePair(different.donor.pairs[i,1], different.donor.pairs[i,2], 12, downsample)
+  different.donor.pairs$spearman.cor[i] = result$spearman.cor
+  #plots <- c(plots, list(result$plot))
+}
+
+# do.call(grid.arrange, c(plots, nrow=5, list(top=textGrob("Different donors (all P2V2) - normalized expression", gp=gpar(fontsize=16,fontface="bold")))))
+
+print(median(different.donor.pairs$spearman.cor))
+```
+
+Plot a histogram showing the distribution of correlation coefficients for extraction replicates, differentiation replicates, and cross-donor correlation.
+```{r CorrelationDistribution}
+extraction.rep.pairs$type = "Extraction replicates"
+differentiation.rep.pairs.P2V2$type = "Differentiation replicates"
+different.donor.pairs$type = "Different donors"
+hist.df = rbind(extraction.rep.pairs[,c(1,2,5,6)], differentiation.rep.pairs.P2V2[,c(1,2,5,6)], different.donor.pairs[,c(1,2,5,6)])
+
+fname = "results/replicates/compare_replicates.correlations.df.txt"
+write.table(hist.df, fname, sep="\t", row.names=F, col.names=T, quote=F)
+#hist.df = read.delim(fname)
+
+ggplot(hist.df, aes(spearman.cor, fill=type)) + geom_density(alpha = 0.5)
+
+ggplot(hist.df, aes(spearman.cor, fill=type)) + 
+  geom_histogram(binwidth=0.005, position="dodge") + 
+  facet_wrap(~type, nrow=3, scales="free_y") +
+  theme_bw(18) +
+  theme(legend.position = "none") + 
+  xlab("Spearman correlation")
+```
