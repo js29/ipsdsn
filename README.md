@@ -14,6 +14,7 @@ The code includes:
 * **data** - input data for analyses (e.g. sample metadata)
 * **pipeline** - scripts to process raw data, e.g. alignment, quantification
 * **utils** - utility scripts
+* **supp** - supplementary tables from the paper
 
 Scripts within these directories may refer to files that are not part of the Github repository. Aligned BAM files are available from EGA (EGAD00001003145, 80 managed-access RNA-seq samples) or from ENA (accession ERP020576, 51 open-access RNA-seq samples). Similarly, ATAC-seq data for 8 and 23 managed and open-access samples are available. Summary statistics and gene expression counts are available at https://www.ebi.ac.uk/biostudies/studies/S-BSST16.
 Expression counts are not provided in the github repository, as they are available at the biostudies link above. Also, only expression counts for open-access samples could be provided.
